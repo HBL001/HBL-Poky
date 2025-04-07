@@ -1,0 +1,48 @@
+Upstream-Status: Inappropriate [oe specific]
+
+From 26649d94ae45596f6af1b715e9777b293ea37a73 Mon Sep 17 00:00:00 2001
+From: customer <customer@company.com>
+Date: Wed, 26 Mar 2025 12:37:05 +0000
+Subject: [PATCH] Add SPI0 ready for FT843
+
+---
+ .../arm/boot/dts/ti/omap/am335x-boneblack.dts | 29 +++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/arch/arm/boot/dts/ti/omap/am335x-boneblack.dts b/arch/arm/boot/dts/ti/omap/am335x-boneblack.dts
+index 1f4b11d1544a..0d7c8b0ca341 100644
+--- a/arch/arm/boot/dts/ti/omap/am335x-boneblack.dts
++++ b/arch/arm/boot/dts/ti/omap/am335x-boneblack.dts
+@@ -173,3 +173,32 @@ &gpio3 {
+ &baseboard_eeprom {
+ 	vcc-supply = <&ldo4_reg>;
+ };
++
++
++/*
++* Pin configurations for the SPI0 port 
++* The 4D LCD display uses this port
++*/
++
++&am33xx_pinmux {
++    spi0_pins: spi0_pins {
++        pinctrl-single,pins = <
++            AM33XX_PADCONF(AM335X_PIN_SPI0_SCLK, PIN_INPUT_PULLUP, MUX_MODE0) /* P9_22: spi0_sclk */
++            AM33XX_PADCONF(AM335X_PIN_SPI0_D0, PIN_INPUT_PULLUP, MUX_MODE0)   /* P9_21: spi0_d0 (MISO) */
++            AM33XX_PADCONF(AM335X_PIN_SPI0_D1, PIN_OUTPUT_PULLUP, MUX_MODE0)  /* P9_18: spi0_d1 (MOSI) */
++            AM33XX_PADCONF(AM335X_PIN_SPI0_CS0, PIN_OUTPUT_PULLUP, MUX_MODE0) /* P9_17: spi0_cs0 */
++        >;
++    };
++};
++
++&spi0 {
++    status = "okay";
++    pinctrl-names = "default";
++    pinctrl-0 = <&spi0_pins>;
++
++    spidev@0 {
++        compatible = "spidev";
++        reg = <0>;
++        spi-max-frequency = <10000000>; /* Adjust as needed */
++    };
++};

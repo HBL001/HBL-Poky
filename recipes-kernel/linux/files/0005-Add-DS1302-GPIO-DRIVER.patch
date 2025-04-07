@@ -1,0 +1,240 @@
+Upstream-Status: Inappropriate [oe specific]
+
+diff --git a/arch/arm/boot/dts/ti/omap/am335x-boneblack.dts b/arch/arm/boot/dts/ti/omap/am335x-boneblack.dts
+index 7f7e6e8c4eca..f5cb88b73903 100644
+--- a/arch/arm/boot/dts/ti/omap/am335x-boneblack.dts
++++ b/arch/arm/boot/dts/ti/omap/am335x-boneblack.dts
+@@ -233,3 +233,14 @@ tps: tps@24 {
+ 		ti,pmic-shutdown-controller;
+ 	};
+ };
++
++&ocp {
++    rtc_ds1302_gpio: rtc@0 {
++        compatible = "maxim,ds1302-gpio";
++        ce-gpios = <&gpio2 2 GPIO_ACTIVE_HIGH>;
++        sclk-gpios = <&gpio2 3 GPIO_ACTIVE_HIGH>;
++        io-gpios = <&gpio2 4 GPIO_ACTIVE_HIGH>;
++        status = "okay";
++    };
++};
++
+diff --git a/drivers/rtc/Kconfig b/drivers/rtc/Kconfig
+index d7502433c78a..61d5c6913594 100644
+--- a/drivers/rtc/Kconfig
++++ b/drivers/rtc/Kconfig
+@@ -751,6 +751,16 @@ config RTC_DRV_DS1302
+ 	  This driver can also be built as a module. If so, the module
+ 	  will be called rtc-ds1302.
+ 
++config RTC_DRV_DS1302_GPIO
++	tristate "Dallas DS1302 GPIO"
++	depends on GPIOLIB && OF_GPIO
++	help
++	  If you say yes here you get support for the Dallas DS1302 RTC chips
++	  using GPIO bitbang interface.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called rtc-ds1302-gpio.
++
+ config RTC_DRV_DS1305
+ 	tristate "Dallas/Maxim DS1305/DS1306"
+ 	help
+diff --git a/drivers/rtc/Makefile b/drivers/rtc/Makefile
+index fd209883ee2e..e343f792a365 100644
+--- a/drivers/rtc/Makefile
++++ b/drivers/rtc/Makefile
+@@ -49,6 +49,7 @@ obj-$(CONFIG_RTC_DRV_DIGICOLOR)	+= rtc-digicolor.o
+ obj-$(CONFIG_RTC_DRV_DS1216)	+= rtc-ds1216.o
+ obj-$(CONFIG_RTC_DRV_DS1286)	+= rtc-ds1286.o
+ obj-$(CONFIG_RTC_DRV_DS1302)	+= rtc-ds1302.o
++obj-$(CONFIG_RTC_DRV_DS1302_GPIO)	+= rtc-ds1302-gpio.o
+ obj-$(CONFIG_RTC_DRV_DS1305)	+= rtc-ds1305.o
+ obj-$(CONFIG_RTC_DRV_DS1307)	+= rtc-ds1307.o
+ obj-$(CONFIG_RTC_DRV_DS1343)	+= rtc-ds1343.o
+diff --git a/drivers/rtc/rtc-ds1302-gpio.c b/drivers/rtc/rtc-ds1302-gpio.c
+new file mode 100644
+index 000000000000..642574a4c536
+--- /dev/null
++++ b/drivers/rtc/rtc-ds1302-gpio.c
+@@ -0,0 +1,180 @@
++[200~// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * GPIO-based Dallas DS1302 RTC driver
++ * Adapted for modern kernel APIs
++ */
++
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/rtc.h>
++#include <linux/gpio.h>
++#include <linux/of_gpio.h>
++#include <linux/delay.h>
++#include <linux/bcd.h>
++
++#define DRV_NAME ds1302-gpio
++
++#define RTC_CMD_READ  0x81
++#define RTC_CMD_WRITE 0x80
++
++#define RTC_ADDR_CTRL 0x07
++#define RTC_ADDR_YEAR 0x06
++#define RTC_ADDR_MON  0x04
++#define RTC_ADDR_DATE 0x03
++#define RTC_ADDR_HOUR 0x02
++#define RTC_ADDR_MIN  0x01
++#define RTC_ADDR_SEC  0x00
++#define RTC_ADDR_DAY  0x05
++
++struct ds1302 {
++int ce_gpio, clk_gpio, io_gpio;
++struct rtc_device *rtc;
++};
++
++static void ds1302_set_output(struct ds1302 *ds)
++{
++gpio_direction_output(ds->io_gpio, 0);
++}
++
++static void ds1302_set_input(struct ds1302 *ds)
++{
++gpio_direction_input(ds->io_gpio);
++}
++
++static void ds1302_write_bit(struct ds1302 *ds, int bit)
++{
++gpio_set_value(ds->io_gpio, bit);
++gpio_set_value(ds->clk_gpio, 1);
++udelay(1);
++gpio_set_value(ds->clk_gpio, 0);
++udelay(1);
++}
++
++static int ds1302_read_bit(struct ds1302 *ds)
++{
++int val = gpio_get_value(ds->io_gpio);
++gpio_set_value(ds->clk_gpio, 1);
++udelay(1);
++gpio_set_value(ds->clk_gpio, 0);
++udelay(1);
++return val;
++}
++
++static void ds1302_write_byte(struct ds1302 *ds, u8 byte)
++{
++ds1302_set_output(ds);
++for (int i = 0; i < 8; i++)
++ds1302_write_bit(ds, byte >> i & 0x1);
++}
++
++static u8 ds1302_read_byte(struct ds1302 *ds)
++{
++u8 val = 0;
++ds1302_set_input(ds);
++for (int i = 0; i < 8; i++)
++val |= ds1302_read_bit(ds) << i;
++return val;
++}
++
++static void ds1302_start(struct ds1302 *ds)
++{
++gpio_set_value(ds->ce_gpio, 1);
++udelay(4);
++}
++
++static void ds1302_stop(struct ds1302 *ds)
++{
++gpio_set_value(ds->ce_gpio, 0);
++udelay(4);
++}
++
++static u8 ds1302_read(struct ds1302 *ds, u8 addr)
++{
++u8 val;
++ds1302_start(ds);
++ds1302_write_byte(ds, (addr << 1) | 1);
++val = ds1302_read_byte(ds);
++ds1302_stop(ds);
++return val;
++}
++
++static void ds1302_write(struct ds1302 *ds, u8 addr, u8 val)
++{
++ds1302_start(ds);
++ds1302_write_byte(ds, addr << 1);
++ds1302_write_byte(ds, val);
++ds1302_stop(ds);
++}
++
++static int ds1302_rtc_read_time(struct device *dev, struct rtc_time *tm)
++{
++struct ds1302 *ds = dev_get_drvdata(dev);
++tm->tm_sec  = bcd2bin(ds1302_read(ds, RTC_ADDR_SEC));
++tm->tm_min  = bcd2bin(ds1302_read(ds, RTC_ADDR_MIN));
++tm->tm_hour = bcd2bin(ds1302_read(ds, RTC_ADDR_HOUR));
++tm->tm_mday = bcd2bin(ds1302_read(ds, RTC_ADDR_DATE));
++tm->tm_mon  = bcd2bin(ds1302_read(ds, RTC_ADDR_MON)) - 1;
++tm->tm_year = bcd2bin(ds1302_read(ds, RTC_ADDR_YEAR));
++if (tm->tm_year < 70)
++tm->tm_year += 100;
++return 0;
++}
++
++static int ds1302_rtc_set_time(struct device *dev, struct rtc_time *tm)
++{
++struct ds1302 *ds = dev_get_drvdata(dev);
++ds1302_write(ds, RTC_ADDR_CTRL, 0x00); // Write enable
++ds1302_write(ds, RTC_ADDR_SEC,  bcd2bin(tm->tm_sec));
++ds1302_write(ds, RTC_ADDR_MIN,  bcd2bin(tm->tm_min));
++ds1302_write(ds, RTC_ADDR_HOUR, bcd2bin(tm->tm_hour));
++ds1302_write(ds, RTC_ADDR_DATE, bcd2bin(tm->tm_mday));
++ds1302_write(ds, RTC_ADDR_MON,  bcd2bin(tm->tm_mon + 1));
++ds1302_write(ds, RTC_ADDR_YEAR, bcd2bin(tm->tm_year % 100));
++ds1302_write(ds, RTC_ADDR_CTRL, 0x80); // Write disable
++return 0;
++}
++
++static const struct rtc_class_ops ds1302_ops = {
++.read_time = ds1302_rtc_read_time,
++.set_time  = ds1302_rtc_set_time,
++};
++
++static int ds1302_probe(struct platform_device *pdev)
++{
++struct ds1302 *ds;
++ds = devm_kzalloc(&pdev->dev, sizeof(*ds), GFP_KERNEL);
++return -ENOMEM;
++
++ds->ce_gpio   = of_get_named_gpio(pdev->dev.of_node, ce-gpios, 0);
++ds->clk_gpio  = of_get_named_gpio(pdev->dev.of_node, sclk-gpios, 0);
++ds->io_gpio   = of_get_named_gpio(pdev->dev.of_node, io-gpios, 0);
++return -EINVAL;
++
++devm_gpio_request_one(&pdev->dev, ds->ce_gpio, GPIOF_OUT_INIT_LOW, ds1302_ce);
++devm_gpio_request_one(&pdev->dev, ds->clk_gpio, GPIOF_OUT_INIT_LOW, ds1302_clk);
++devm_gpio_request_one(&pdev->dev, ds->io_gpio, GPIOF_IN, ds1302_io);
++
++platform_set_drvdata(pdev, ds);
++ds->rtc = devm_rtc_device_register(&pdev->dev, DRV_NAME, &ds1302_ops, THIS_MODULE);
++return PTR_ERR_OR_ZERO(ds->rtc);
++}
++
++static const struct of_device_id ds1302_dt_ids[] = {
++{ .compatible = maxim,ds1302-gpio },
++{}
++};
++MODULE_DEVICE_TABLE(of, ds1302_dt_ids);
++
++static struct platform_driver ds1302_driver = {
++.driver = {
++.name = DRV_NAME,
++.of_match_table = ds1302_dt_ids,
++},
++.probe = ds1302_probe,
++};
++module_platform_driver(ds1302_driver);
++
++MODULE_AUTHOR(Highland Biosciences Ltd / Adapted for modern kernels);
++MODULE_DESCRIPTION(Dallas DS1302 GPIO RTC Driver);
++MODULE_LICENSE(GPL v2);
++~

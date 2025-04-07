@@ -1,0 +1,35 @@
+Upstream-Status: Inappropriate [oe specific]
+
+From ae903ebfa631ffe714e3cea66bd5fe51e8ffa428 Mon Sep 17 00:00:00 2001
+From: customer <customer@company.com>
+Date: Fri, 28 Mar 2025 18:40:07 +0000
+Subject: [PATCH] 0004-Add-IRQ-7-TPS62517-PMIC
+
+---
+ arch/arm/boot/dts/ti/omap/am335x-boneblack.dts | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/arch/arm/boot/dts/ti/omap/am335x-boneblack.dts b/arch/arm/boot/dts/ti/omap/am335x-boneblack.dts
+index 7e932bbb1499..7f7e6e8c4eca 100644
+--- a/arch/arm/boot/dts/ti/omap/am335x-boneblack.dts
++++ b/arch/arm/boot/dts/ti/omap/am335x-boneblack.dts
+@@ -220,3 +220,16 @@ &i2c1 {
+     #size-cells = <0>;
+ };
+ 
++&i2c0 {
++	tps: tps@24 {
++		compatible = "ti,tps65217";
++		reg = <0x24>;
++
++		/* PMIC IRQ support for power button and event interrupts */
++		interrupt-parent = <&intc>;
++		interrupts = <7>;
++
++		/* Already handled in base dtsi, but re-declared to extend cleanly */
++		ti,pmic-shutdown-controller;
++	};
++};
+-- 
+2.43.0
+

@@ -1,0 +1,112 @@
+Upstream-Status: Inappropriate [oe specific]
+
+From 667a31d56d265b5603eb41cda2e9f1239783af3c Mon Sep 17 00:00:00 2001
+From: customer <customer@company.com>
+Date: Wed, 26 Mar 2025 17:37:35 +0000
+Subject: [PATCH] Add I2C1 and SPI Frequency Limit
+
+---
+ .../arm/boot/dts/ti/omap/am335x-boneblack.dts | 58 ++++++++++++-------
+ 1 file changed, 38 insertions(+), 20 deletions(-)
+
+diff --git a/arch/arm/boot/dts/ti/omap/am335x-boneblack.dts b/arch/arm/boot/dts/ti/omap/am335x-boneblack.dts
+index 0d7c8b0ca341..7e932bbb1499 100644
+--- a/arch/arm/boot/dts/ti/omap/am335x-boneblack.dts
++++ b/arch/arm/boot/dts/ti/omap/am335x-boneblack.dts
+@@ -42,12 +42,12 @@ &gpio0 {
+ 		"P8_32 [lcd d15]",
+ 		"P9_20 [i2c2_sda]",
+ 		"P9_19 [i2c2_scl]",
+-		"P9_26 [uart1_rxd]",
+-		"P9_24 [uart1_txd]",
++		"P9_26 [i2c1_sda]",
++		"P9_24 [i2c1_scl]",
+ 		"[rmii1_txd3]",
+ 		"[rmii1_txd2]",
+ 		"[usb0_drvvbus]",
+-		"[hdmi cec]",
++		"NC",
+ 		"P9_41B",
+ 		"[rmii1_txd1]",
+ 		"P8_19 [ehrpwm2a]",
+@@ -91,7 +91,7 @@ &gpio1 {
+ 		"[usr3 led]",
+ 		"[hdmi irq]",
+ 		"[usb vbus oc]",
+-		"[hdmi audio]",
++		"NC",
+ 		"P9_12",
+ 		"P8_26",
+ 		"P8_21 [emmc]",
+@@ -106,26 +106,26 @@ &gpio2 {
+ 		"P8_8",
+ 		"P8_10",
+ 		"P8_9",
+-		"P8_45 [hdmi]",
+-		"P8_46 [hdmi]",
+-		"P8_43 [hdmi]",
+-		"P8_44 [hdmi]",
+-		"P8_41 [hdmi]",
+-		"P8_42 [hdmi]",
+-		"P8_39 [hdmi]",
+-		"P8_40 [hdmi]",
+-		"P8_37 [hdmi]",
+-		"P8_38 [hdmi]",
+-		"P8_36 [hdmi]",
+-		"P8_34 [hdmi]",
++		"P8_45",
++		"P8_46",
++		"P8_43",
++		"P8_44",
++		"P8_41",
++		"P8_42",
++		"P8_39",
++		"P8_40",
++		"P8_37",
++		"P8_38",
++		"P8_36",
++		"P8_34",
+ 		"[rmii1_rxd3]",
+ 		"[rmii1_rxd2]",
+ 		"[rmii1_rxd1]",
+ 		"[rmii1_rxd0]",
+-		"P8_27 [hdmi]",
+-		"P8_29 [hdmi]",
+-		"P8_28 [hdmi]",
+-		"P8_30 [hdmi]",
++		"P8_27",
++		"P8_29",
++		"P8_28",
++		"P8_30",
+ 		"[mmc0_dat3]",
+ 		"[mmc0_dat2]",
+ 		"[mmc0_dat1]",
+@@ -189,6 +189,14 @@ AM33XX_PADCONF(AM335X_PIN_SPI0_D1, PIN_OUTPUT_PULLUP, MUX_MODE0)  /* P9_18: spi0
+             AM33XX_PADCONF(AM335X_PIN_SPI0_CS0, PIN_OUTPUT_PULLUP, MUX_MODE0) /* P9_17: spi0_cs0 */
+         >;
+     };
++
++    i2c1_pins: pinmux_i2c1_pins {
++        pinctrl-single,pins = <
++            AM33XX_PADCONF(AM335X_PIN_UART1_RXD, PIN_INPUT_PULLUP, MUX_MODE3) /* P9_26: i2c1_sda */
++            AM33XX_PADCONF(AM335X_PIN_UART1_TXD, PIN_INPUT_PULLUP, MUX_MODE3) /* P9_24: i2c1_scl */
++        >;
++    };
++
+ };
+ 
+ &spi0 {
+@@ -202,3 +210,13 @@ spidev@0 {
+         spi-max-frequency = <10000000>; /* Adjust as needed */
+     };
+ };
++
++&i2c1 {
++    status = "okay";
++    pinctrl-names = "default";
++    pinctrl-0 = <&i2c1_pins>;
++    clock-frequency = <100000>;
++    #address-cells = <1>;
++    #size-cells = <0>;
++};
++

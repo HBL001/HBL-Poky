@@ -1,0 +1,38 @@
+From a932a5bafa1648d17624d5824ae2f5094a2fad58 Mon Sep 17 00:00:00 2001
+From: customer <customer@company.com>
+Date: Mon, 7 Apr 2025 18:18:33 +0100
+Subject: [PATCH] Flip-sdcard-pin-logic
+
+---
+ arch/arm/dts/am335x-boneblack.dts | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm/dts/am335x-boneblack.dts b/arch/arm/dts/am335x-boneblack.dts
+index b956e2f60fe..07b6f8c04b9 100644
+--- a/arch/arm/dts/am335x-boneblack.dts
++++ b/arch/arm/dts/am335x-boneblack.dts
+@@ -7,7 +7,7 @@
+ #include "am33xx.dtsi"
+ #include "am335x-bone-common.dtsi"
+ #include "am335x-boneblack-common.dtsi"
+-#include "am335x-boneblack-hdmi.dtsi"
++
+ 
+ / {
+ 	model = "TI AM335x BeagleBone Black";
+@@ -172,3 +172,12 @@
+ &baseboard_eeprom {
+ 	vcc-supply = <&ldo4_reg>;
+ };
++
++&mmc1 {
++    /* 
++     * (HBL-001 Rev A patch)  MicroSD storage card replaced with shielded one
++     * Tells the driver that the card-detect signal is inverted.
++    */
++    cd-inverted;
++};
++
+-- 
+2.43.0
+
