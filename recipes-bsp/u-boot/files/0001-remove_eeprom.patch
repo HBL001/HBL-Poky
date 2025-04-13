@@ -1,66 +1,32 @@
 Upstream-Status: Inappropriate [oe specific]
 
-From 771d679db90e468ebeb08cc475f5af97f1655a30 Mon Sep 17 00:00:00 2001
+From 13c32f0cb5a8c82ff0e46f43250c20907e7c0faf Mon Sep 17 00:00:00 2001
 From: customer <customer@company.com>
-Date: Mon, 7 Apr 2025 14:45:27 +0100
-Subject: [PATCH] This disables access to the i2c eeprom for u-boot
+Date: Fri, 11 Apr 2025 16:53:39 +0100
+Subject: [PATCH] Identify new boards
 
 ---
- board/ti/common/board_detect.c | 41 ----------------------------------
- 1 file changed, 41 deletions(-)
+ board/ti/common/board_detect.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
 
 diff --git a/board/ti/common/board_detect.c b/board/ti/common/board_detect.c
-index 38e23ccbb67..dc6f1eff7b4 100644
+index 38e23ccbb67..cec51261d88 100644
 --- a/board/ti/common/board_detect.c
 +++ b/board/ti/common/board_detect.c
-@@ -300,47 +300,6 @@ already_set:
+@@ -319,8 +319,11 @@ int __maybe_unused ti_i2c_eeprom_am_get(int bus_addr, int dev_addr)
  
- int __maybe_unused ti_i2c_eeprom_am_get(int bus_addr, int dev_addr)
- {
--	int rc;
--	struct ti_am_eeprom am_ep;
--	struct ti_common_eeprom *ep;
--
--	ep = TI_EEPROM_DATA;
--#ifndef CONFIG_SPL_BUILD
--	if (ep->header == TI_EEPROM_HEADER_MAGIC)
--		return 0; /* EEPROM has already been read */
--#endif
--
--	/* Initialize with a known bad marker for i2c fails.. */
--	ep->header = TI_DEAD_EEPROM_MAGIC;
--	ep->name[0] = 0x0;
--	ep->version[0] = 0x0;
--	ep->serial[0] = 0x0;
--	ep->config[0] = 0x0;
--
--	rc = ti_i2c_eeprom_get(bus_addr, dev_addr, TI_EEPROM_HEADER_MAGIC,
--			       sizeof(am_ep), (uint8_t *)&am_ep);
+ 	rc = ti_i2c_eeprom_get(bus_addr, dev_addr, TI_EEPROM_HEADER_MAGIC,
+ 			       sizeof(am_ep), (uint8_t *)&am_ep);
 -	if (rc)
 -		return rc;
--
--	ep->header = am_ep.header;
--	strlcpy(ep->name, am_ep.name, TI_EEPROM_HDR_NAME_LEN + 1);
--	ti_eeprom_string_cleanup(ep->name);
--
--	/* BeagleBone Green '1' eeprom, board_rev: 0x1a 0x00 0x00 0x00 */
--	if (am_ep.version[0] == 0x1a && am_ep.version[1] == 0x00 &&
--	    am_ep.version[2] == 0x00 && am_ep.version[3] == 0x00)
--		strlcpy(ep->version, "BBG1", TI_EEPROM_HDR_REV_LEN + 1);
--	else
--		strlcpy(ep->version, am_ep.version, TI_EEPROM_HDR_REV_LEN + 1);
--	ti_eeprom_string_cleanup(ep->version);
--	strlcpy(ep->serial, am_ep.serial, TI_EEPROM_HDR_SERIAL_LEN + 1);
--	ti_eeprom_string_cleanup(ep->serial);
--	strlcpy(ep->config, am_ep.config, TI_EEPROM_HDR_CONFIG_LEN + 1);
--	ti_eeprom_string_cleanup(ep->config);
--
--	memcpy(ep->mac_addr, am_ep.mac_addr,
--	       TI_EEPROM_HDR_NO_OF_MAC_ADDR * TI_EEPROM_HDR_ETH_ALEN);
--
- 	return 0;
- }
++	
++	if (rc || am_ep.header != TI_EEPROM_HEADER_MAGIC) {
++               printf("New Instrument, storing default BBB Rev C\n");
++               return ti_i2c_eeprom_am_set("A335BNLT","C");
++        }
  
+ 	ep->header = am_ep.header;
+ 	strlcpy(ep->name, am_ep.name, TI_EEPROM_HDR_NAME_LEN + 1);
 -- 
 2.43.0
 
