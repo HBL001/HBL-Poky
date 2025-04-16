@@ -1,3 +1,17 @@
+ld/tmp/deploy/images/beaglebone-yocto$ sudo fdisk -l /dev/mmcblk0
+Disk /dev/mmcblk0: 29.44 GiB, 31609323520 bytes, 61736960 sectors
+Units: sectors of 1 * 512 = 512 bytes
+Sector size (logical/physical): 512 bytes / 512 bytes
+I/O size (minimum/optimal): 512 bytes / 512 bytes
+Disklabel type: dos
+Disk identifier: 0x076c4a2a
+
+Device         Boot Start     End Sectors   Size Id Type
+/dev/mmcblk0p1 *    16384   81919   65536    32M  c W95 FAT32 (LBA)
+/dev/mmcblk0p2      81920 1197071 1115152 544.5M 83 Linux
+user@user-Aspire-5750:/media/user/1734145a-ed10-4f95-b476-9e5dd16c2249/yocto-build/tmp/deploy/images/beaglebone-yocto$ 
+
+
 default Yocto
 label Yocto
    kernel /zImage
