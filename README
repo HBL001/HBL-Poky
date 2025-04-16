@@ -1,4 +1,4 @@
-#This repo contains the meta-custom layer and build/conf files needed to patch the Styhead Yocto release of Poky 
+*This repo contains the meta-custom layer and build/conf files needed to patch the Styhead Yocto release of Poky 
 
 Please see the corresponding sections below for details.
 
