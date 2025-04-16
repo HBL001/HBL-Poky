@@ -1,3 +1,13 @@
+# short-description: Create SD card image for Beaglebone
+# long-description: Creates a partitioned SD card image for Beaglebone.
+# Boot files are located in the first vfat partition.
+
+part /boot --source bootimg-partition --ondisk mmcblk1 --fstype=vfat --label boot --active --align 8192 --size 16 --sourceparams="loader=u-boot" --use-uuid
+part /     --source rootfs --ondisk mmcblk1 --fstype=ext4 --label root --align 8192 --use-uuid
+bootloader --ptable msdos --append="console=ttyS0,115200"
+
+
+
 ld/tmp/deploy/images/beaglebone-yocto$ sudo fdisk -l /dev/mmcblk0
 Disk /dev/mmcblk0: 29.44 GiB, 31609323520 bytes, 61736960 sectors
 Units: sectors of 1 * 512 = 512 bytes
