@@ -1,0 +1,136 @@
+default Yocto
+label Yocto
+   kernel /zImage
+   fdtdir /
+append root=PARTUUID=4963c00f-02 rootwait console=ttyO0,115200 root=LABEL=rootfs rootfstype=ext4 rootwait
+
+user@user-Aspire-5750:~/poky/build$ wic create biobeagle -e core-image-minimal
+INFO: Building wic-tools...
+
+Loading cache: 100% |#############################################################| Time: 0:00:05
+Loaded 4904 entries from dependency cache.
+NOTE: Resolving any missing task queue dependencies
+
+Build Configuration:
+BB_VERSION           = "2.9.1"
+BUILD_SYS            = "x86_64-linux"
+NATIVELSBSTRING      = "universal"
+TARGET_SYS           = "arm-poky-linux-gnueabi"
+MACHINE              = "beaglebone-yocto"
+DISTRO               = "poky"
+DISTRO_VERSION       = "5.1.4"
+TUNE_FEATURES        = "arm vfp cortexa8 neon callconvention-hard"
+TARGET_FPU           = "hard"
+meta                 
+meta-poky            
+meta-yocto-bsp       = "styhead:70dc28ac287bf35541270cae1d99130a0f6b7b5f"
+meta-oe              
+meta-python          
+meta-networking      
+meta-filesystems     = "styhead:c93994f1bb601c57548b588d4f77a044d90822cf"
+meta-virtualization  = "styhead:247ea9c3880a257003ce2cc566fcdbb307ea4374"
+meta-custom          = "main:313b1e80da86ee2997b055964ade48d206cebbc3"
+
+Sstate summary: Wanted 52 Local 52 Mirrors 0 Missed 0 Current 217 (100% match, 100% complete)0:00
+Initialising tasks: 100% |########################################################| Time: 0:00:01
+NOTE: Executing Tasks
+NOTE: Tasks Summary: Attempted 813 tasks of which 813 didn't need to be rerun and all succeeded.
+INFO: Creating image(s)...
+
+INFO: The new image(s) can be found here:
+  ./biobeagle-202504161025-mmcblk0.direct
+
+The following build artifacts were used to create the image(s):
+  ROOTFS_DIR:                   /media/user/1734145a-ed10-4f95-b476-9e5dd16c2249/yocto-build/tmp/work/beaglebone_yocto-poky-linux-gnueabi/core-image-minimal/1.0/rootfs
+  BOOTIMG_DIR:                  /media/user/1734145a-ed10-4f95-b476-9e5dd16c2249/yocto-build/tmp/work/beaglebone_yocto-poky-linux-gnueabi/core-image-minimal/1.0/recipe-sysroot/usr/share
+  KERNEL_DIR:                   /media/user/1734145a-ed10-4f95-b476-9e5dd16c2249/yocto-build/tmp/deploy/images/beaglebone-yocto
+  NATIVE_SYSROOT:               /media/user/1734145a-ed10-4f95-b476-9e5dd16c2249/yocto-build/tmp/work/cortexa8hf-neon-poky-linux-gnueabi/wic-tools/1.0/recipe-sysroot-native
+
+INFO: The image(s) were created using OE kickstart file:
+  /home/user/poky/meta-custom/wic/biobeagle.wks
+user@user-Aspire-5750:~/poky/build$ ls
+biobeagle-202504161025-mmcblk0.direct     cache           grep
+biobeagle-202504161025-mmcblk0.direct.p1  conf            pn-buildlist
+biobeagle-202504161025-mmcblk0.direct.p2  debugfs_script  task-depends.dot
+bitbake-cookerdaemon.log                  fstab           workspace
+
+user@user-Aspire-5750:~/poky/meta-custom/wic$ cat biobeagle.wks
+# short-description: Create SD card image for Beaglebone
+# long-description: Creates a partitioned SD card image for Beaglebone.
+# Boot files are located in the first vfat partition.
+
+part /boot --source bootimg-partition --ondisk mmcblk0 --fstype=vfat --label boot --active --align 4 --fixed-size 32 --sourceparams="loader=u-boot" --use-uuid
+
+part / --source rootfs --ondisk mmcblk0 --fstype=ext4 --label root --align 4 --use-uuid
+
+bootloader --ptable msdos --append="console=ttyO0,115200 root=LABEL=rootfs rootfstype=ext4 rootwait"
+
+user@user-Aspire-5750:~/poky/meta-custom/wic$ 
+
+
+user@user-Aspire-5750:~/poky/build$ cat conf/local.conf
+#
+# HBL-001 A billy basic board to make scientific instruments 
+# Yocto linux - Styhead
+#
+
+# Hardware support
+MACHINE = "beaglebone-yocto"
+#MACHINE ?= "qemuarm"
+MACHINE_FEATURES:remove = " kernel-alsa hdmi"
+MACHINE_FEATURES:append = " rtc"
+
+# Where to place downloads - ${TOPDIR}/../../../..
+DL_DIR = "/media/user/1734145a-ed10-4f95-b476-9e5dd16c2249/yocto-build/downloads"
+SSTATE_DIR = "/media/user/1734145a-ed10-4f95-b476-9e5dd16c2249/yocto-build/sstate-cache"
+TMPDIR = "/media/user/1734145a-ed10-4f95-b476-9e5dd16c2249/yocto-build/tmp"
+
+# Install Docker and SSH onto the Target
+IMAGE_INSTALL:append = " docker docker-compose dropbear"
+IMAGE_INSTALL:remove = " mesa mesa-pvr ti-sgx-ddk-km ti-sgx-ddk-um xf86-video-fbdev xf86-video-modesetting kernel-modules"
+
+# Select the default init manager (systemd)
+INIT_MANAGER = "systemd"
+VIRTUAL-RUNTIME_init_manager = "systemd"
+
+# Additional rootfs image types
+IMAGE_FSTYPES += "wic"
+
+# Meego Image Creator
+# use the custom version of the beaglebone-yocto.wks that is in meta-custom
+WKS_FILES_DIRS:prepend = "${TOPDIR}/meta-custom/wic/files:"
+WKS_SEARCH_PATH:prepend = "/home/user/poky/meta-custom/wic/files:"
+WKS_FILE = "biobeagle.wks"
+
+DISTRO ?= "poky"
+DISTRO_FEATURES:remove = " x11 wayland opengl pulseaudio alsa hdmi"
+DISTRO_FEATURES:append = " virtualization"
+
+PACKAGE_CLASSES ?= "package_deb"
+SDKMACHINE ?= "x86_64"
+
+EXTRA_IMAGE_FEATURES ?= "allow-empty-password empty-root-password allow-root-login"
+
+USER_CLASSES ?= "buildstats"
+
+PATCHRESOLVE = "noop"
+
+BB_NUMBER_THREADS = "4"
+PARALLEL_MAKE = "-j4"
+
+# Disk Space Monitoring during the build
+BB_DISKMON_DIRS ??= "\
+    STOPTASKS,${TMPDIR},1G,100K \
+    STOPTASKS,${DL_DIR},1G,100K \
+    STOPTASKS,${SSTATE_DIR},1G,100K \
+    STOPTASKS,/tmp,100M,100K \
+    HALT,${TMPDIR},100M,1K \
+    HALT,${DL_DIR},100M,1K \
+    HALT,${SSTATE_DIR},100M,1K \
+    HALT,/tmp,10M,1K"
+
+user@user-Aspire-5750:~/poky/build$ 
+
+
+
+
