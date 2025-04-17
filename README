@@ -1,3 +1,14 @@
+I havent had chance to write this quite yet.
+
+This repo is a meta-custom layer that you need to put in your cloned Poky directory
+
+Go into poky and clone this repo
+
+Make your build environment  . ./OE etc etc
+
+
+
+
 *This repo contains the meta-custom layer and build/conf files needed to patch the Styhead Yocto release of Poky 
 
 Please see the corresponding sections below for details.
