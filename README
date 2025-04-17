@@ -6,6 +6,18 @@ Go into poky and clone this repo
 
 Make your build environment  . ./OE etc etc
 
+Take the local.conf etc from the install files in this repo.
+
+
+Do a bitbake core-image-minimal  and it will download and patch everything for you.
+
+The SDcard image will appear as a wic file, and make a card with "sudo dd ......."
+
+Put it in the beagle and boot up.   The card will say "loading from mmc2".  To get rid of that edit the u-boot customisations and get rid of the "sd-card" inverted.
+
+Hopefully I have saved you a day of work !
+
+
 
 
 
