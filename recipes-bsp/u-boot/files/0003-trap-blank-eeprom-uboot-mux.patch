@@ -1,0 +1,30 @@
+Upstream-Status: Inappropriate [oe specific] 
+
+From 917d610fbec210b773f442990aafbe42b4d0a2f7 Mon Sep 17 00:00:00 2001
+From: customer <customer@company.com>
+Date: Fri, 18 Apr 2025 21:08:30 +0100
+Subject: [PATCH] trap-blank-eeprom-uboot-mux
+
+---
+ board/ti/am335x/mux.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/board/ti/am335x/mux.c b/board/ti/am335x/mux.c
+index 0bad154f86e..229b6baf684 100644
+--- a/board/ti/am335x/mux.c
++++ b/board/ti/am335x/mux.c
+@@ -433,6 +433,10 @@ void enable_board_pin_mux(void)
+ 		configure_module_pin_mux(spi0_pin_mux);
+ 	} else {
+ 		/* Unknown board. We might still be able to boot. */
+-		puts("Bad EEPROM or unknown board, cannot configure pinmux.");
++	        /* patch derived from cb86a91e - see beagleboard.org */
++		puts("Applying Beaglebone Black Pin Mux");
++		configure_module_pin_mux(mii1_pin_mux);
++		configure_module_pin_mux(mmc0_pin_mux);
++		configure_module_pin_mux(mmc1_pin_mux);
+ 	}
+ }
+-- 
+2.43.0
+
