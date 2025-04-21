@@ -1,1 +1,7 @@
-This repo has some basic changes to the standard TI-meta layer that will improve matters.
+This repo has some basic changes to the standard TI-meta layer that will improve matters, if you are using the Poky version of Yocto rather than the Arago.
+
+Arago is not being used because HBL also support a lot of other boards and systems that already use the Poky version. 
+
+The repo contents form a meta-custom layer, and also see the install directory for customised local.conf that will boot your BBB
+
+The branch is currently Scarthgap, but Styhead will follow in a few weeks
