@@ -6,22 +6,13 @@ Go into poky and clone this repo
 
 Make your build environment  . ./OE etc etc
 
-Take the local.conf etc from the install files in this repo.
-
+Take the local.conf etc from the install files in this repo. Dont forget the bblayers or the very nice TI stuff to put in poky/sources
 
 Do a bitbake core-image-minimal  and it will download and patch everything for you.
 
-The SDcard image will appear as a wic file, and make a card with "sudo dd ......."
+The SDcard image will appear as a wic file, and use that bmap tool.
 
-Put it in the beagle and boot up.   The card will say "loading from mmc2".  To get rid of that edit the u-boot customisations and get rid of the "sd-card" inverted.
-
-Hopefully I have saved you a day of work !
-
-
-
-
-
-*This repo contains the meta-custom layer and build/conf files needed to patch the Styhead Yocto release of Poky 
+Power off, press S2 and boot up.   
 
 Please see the corresponding sections below for details.
 
