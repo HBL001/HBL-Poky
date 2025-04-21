@@ -1,6 +1,0 @@
-FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
-SRC_URI += "file://0001-Remove-HDMI-Includes.patch"
-SRC_URI += "file://0002-Add-SPI0-ready-for-FT843.patch"
-SRC_URI += "file://0003-Add-I2C1-and-SPI-Frequency-Limit.patch"
-SRC_URI += "file://0004-Add-IRQ-7-TPS62517-PMIC.patch"
-SRC_URI += "file://0005-Add-DS1302-GPIO-DRIVER.patch"
