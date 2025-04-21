@@ -1,55 +1,9 @@
-I havent had chance to write this quite yet.
+**If you are building a bog standard Beagblebone product, move to the SDCARD branch.**
 
-This repo is a meta-custom layer that you need to put in your cloned Poky directory
+This repo has some basic changes to the standard TI-meta layer that will improve matters, if you are using the Poky version of Yocto rather than the Arago.
 
-Go into poky and clone this repo
+Arago is not being used because HBL also support a lot of other boards and systems that already use the Poky version. 
 
-Make your build environment  . ./OE etc etc
+The repo contents form a meta-custom layer, and also see the install directory for customised local.conf that will boot your BBB
 
-Take the local.conf etc from the install files in this repo. Dont forget the bblayers or the very nice TI stuff to put in poky/sources
-
-Do a bitbake core-image-minimal  and it will download and patch everything for you.
-
-The SDcard image will appear as a wic file, and use that bmap tool.
-
-Power off, press S2 and boot up.   
-
-Please see the corresponding sections below for details.
-
-Dependencies
-============
-
-  URI: <first dependency>
-  branch: <branch name>
-
-  URI: <second dependency>
-  branch: <branch name>
-
-  .
-  .
-  .
-
-Patches
-=======
-
-Please submit any patches against the meta-custom layer to the xxxx mailing list (xxxx@zzzz.org)
-and cc: the maintainer:
-
-Maintainer: XXX YYYYYY <xxx.yyyyyy@zzzzz.com>
-
-Table of Contents
-=================
-
-  I. Adding the meta-custom layer to your build
- II. Misc
-
-
-I. Adding the meta-custom layer to your build
-=================================================
-
-Run 'bitbake-layers add-layer meta-custom'
-
-II. Misc
-========
-
---- replace with specific information about the meta-custom layer ---
+The branch is currently Scarthgap, but Styhead will follow in a few weeks
