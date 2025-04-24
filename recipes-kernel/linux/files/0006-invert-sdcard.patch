@@ -1,0 +1,24 @@
+From 8b462df85f7b2f8011a233b1d00290b4e98c772b Mon Sep 17 00:00:00 2001
+From: customer <customer@company.com>
+Date: Thu, 24 Apr 2025 00:48:35 +0100
+Subject: [PATCH] invert-sdcard
+
+---
+ arch/arm/boot/dts/ti/omap/am335x-boneblack.dts | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/arch/arm/boot/dts/ti/omap/am335x-boneblack.dts b/arch/arm/boot/dts/ti/omap/am335x-boneblack.dts
+index f5cb88b73903..624620dfbe14 100644
+--- a/arch/arm/boot/dts/ti/omap/am335x-boneblack.dts
++++ b/arch/arm/boot/dts/ti/omap/am335x-boneblack.dts
+@@ -244,3 +244,7 @@ rtc_ds1302_gpio: rtc@0 {
+     };
+ };
+ 
++&mmc1 {
++    /* flip the cd line to ACTIVE_HIGH so the card can be detected */
++    cd-gpios = <&gpio0 6 GPIO_ACTIVE_HIGH>;
++};
+-- 
+2.43.0
+
