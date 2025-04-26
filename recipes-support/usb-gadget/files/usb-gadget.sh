@@ -1,69 +1,58 @@
 #!/bin/sh
-# /usr/bin/usb-gadget.sh — configure BBB as a single-function RNDIS gadget
+# /usr/bin/usb-gadget.sh — configure BBB as an RNDIS gadget + static USB0 address
 
 set -e
-# Bail out on any error; prevents half-configured gadget
 
 G=/sys/kernel/config/usb_gadget/bbb
-# Path where ConfigFS exposes our gadget instance
 
-# 1) Load gadget core
+# 1) Load composite core + RNDIS function driver (built-in via CONFIG_USB_CONFIGFS_RNDIS=y)
 modprobe libcomposite
-# Must be present for any composite USB gadget
-
-# 2) (Optional) load the RNDIS function — if built as a module
-#    If you built CONFIG_USB_CONFIGFS_RNDIS=y, this may not be needed.
 modprobe usb_f_rndis || true
 
-# 3) Mount configfs if not already
+# 2) Mount configfs if needed
 mountpoint -q /sys/kernel/config || mount -t configfs none /sys/kernel/config
 
-# 4) Exit if gadget already exists
-[ -d "$G" ] && exit 0
+# 3) If we’ve never configured the gadget, do so now
+if [ ! -d "$G" ]; then
+    cd /sys/kernel/config/usb_gadget
+    mkdir -p bbb && cd bbb
 
-# 5) Create top-level gadget directory
-cd /sys/kernel/config/usb_gadget
-mkdir -p bbb
-cd bbb
+    # Device IDs (you can swap these for 1d6b:0104 if you prefer Linux Foundation defaults)
+    echo 0x0525 > idVendor
+    echo 0xa4a2 > idProduct
+    echo 0x0100 > bcdDevice
+    echo 0x0200 > bcdUSB
 
-# 6) Write device IDs
-echo 0x0525 > idVendor    # “dummy” but Windows-friendly Vendor ID
-echo 0xa4a2 > idProduct   # “dummy” but Windows-friendly Product ID
-echo 0x0100 > bcdDevice   # device release number 1.00
-echo 0x0200 > bcdUSB      # USB specification version 2.00
+    # Microsoft OS descriptors (force RNDIS driver install on Windows)
+    mkdir -p os_desc
+    echo 1       > os_desc/use
+    echo MSFT100 > os_desc/qw_sign
+    echo 0x01    > os_desc/b_vendor_code
 
-# 7) Microsoft OS descriptor, to auto-install RNDIS on Windows hosts
-mkdir -p os_desc
-echo 1       > os_desc/use
-echo MSFT100 > os_desc/qw_sign
-echo 0x01    > os_desc/b_vendor_code
+    # Human-readable strings (en-US)
+    mkdir -p strings/0x409
+    echo "highlandBiosciencesLtd"     > strings/0x409/manufacturer
+    echo "00000000001"        > strings/0x409/serialnumber
+    echo "frankenBeagle" > strings/0x409/product
 
-# 8) Human-readable strings (en-US, 0x409)
-mkdir -p strings/0x409
-echo "BeagleBoard.org"   > strings/0x409/manufacturer
-echo "BBGadget0001"      > strings/0x409/serialnumber
-echo "BeagleBone Black"  > strings/0x409/product
+    # Single RNDIS configuration
+    mkdir -p configs/c.1
+    echo 250 > configs/c.1/MaxPower
 
-# 9) One configuration with a single RNDIS function
-mkdir -p configs/c.1
-echo 250 > configs/c.1/MaxPower
-#    250mA maximum current draw
+    # Create RNDIS function and bind
+    mkdir -p functions
+    mkdir    functions/rndis.usb0
+    ln -s functions/rndis.usb0 configs/c.1/
 
-# 10) Ensure functions/ exists, then create rndis.usb0
-mkdir -p functions
-mkdir    functions/rndis.usb0
-#   This directory comes from CONFIG_USB_CONFIGFS_RNDIS=y
+    # Activate the gadget
+    echo "$(ls /sys/class/udc | head -n1)" > UDC
+fi
 
-# 11) Bind the RNDIS function into our configuration
-ln -s functions/rndis.usb0 configs/c.1/
-
-# 12) Activate the gadget by writing the UDC name
-echo "$(ls /sys/class/udc | head -n1)" > UDC
-
-# 13) Bring up the network interface
+# 4) Bring up the USB network interface and assign the static /30 address
 ip link set dev usb0 up
-ip addr add 192.168.7.2/30 dev usb0
-#    Uses a /30 netmask so only .1 (host) and .2 (device) exist
+ip addr add 192.168.7.2/30 dev usb0 || true
+ip route add default via 192.168.7.1 dev usb0
+
 
 exit 0
 

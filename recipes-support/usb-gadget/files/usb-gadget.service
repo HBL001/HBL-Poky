@@ -1,14 +1,14 @@
 # /lib/systemd/system/usb-gadget.service — systemd unit for RNDIS gadget
 
 [Unit]
-Description=Configure USB RNDIS gadget      # shown in systemctl status
-After=local-fs.target                      # wait until local filesystems are ready
+Description=Configure USB RNDIS gadget     
+After=local-fs.target                     
 
 [Service]
-Type=oneshot                               # run ExecStart once and exit
-ExecStart=/usr/bin/usb-gadget.sh           # the gadget setup script
-RemainAfterExit=yes                        # consider the service "active" after running
+Type=oneshot                              
+ExecStart=/usr/bin/usb-gadget.sh          
+RemainAfterExit=yes                        
 
 [Install]
-WantedBy=multi-user.target                 # enable at runlevels 3/4/5 (typical)
+WantedBy=multi-user.target                 
 
