@@ -1,0 +1,14 @@
+# /lib/systemd/system/usb-gadget.service
+
+[Unit]
+Description=Configure USB RNDIS gadget
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/usb-gadget.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+

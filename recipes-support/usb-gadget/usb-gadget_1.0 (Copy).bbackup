@@ -1,0 +1,33 @@
+DESCRIPTION = "USB RNDIS gadget auto-setup script"
+LICENSE = "MIT"
+S = "${WORKDIR}"
+
+FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
+
+LIC_FILES_CHKSUM = "file://LICENSE;md5=a8ef746efe82910ae8f240946e18eaf6"
+
+SRC_URI = " \
+    file://LICENSE \
+    file://usb-gadget.service \
+    file://usb-gadget.sh \
+"
+
+inherit systemd
+
+SYSTEMD_SERVICE:${PN} = "usb-gadget.service"
+SYSTEMD_AUTO_ENABLE:${PN} = "enable"
+
+do_install() {
+    install -d ${D}${bindir}
+    install -m0755 ${WORKDIR}/usb-gadget.sh ${D}${bindir}/usb-gadget.sh
+
+    install -d ${D}${systemd_system_unitdir}
+    install -m0644 ${WORKDIR}/usb-gadget.service ${D}${systemd_system_unitdir}/usb-gadget.service
+}
+
+# Explicitly list files to avoid QA errors
+FILES:${PN} += " \
+    ${bindir}/usb-gadget.sh \
+    ${systemd_system_unitdir}/usb-gadget.service \
+"
+

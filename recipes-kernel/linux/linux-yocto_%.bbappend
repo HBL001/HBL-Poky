@@ -5,3 +5,5 @@ SRC_URI += "file://0003-Add-I2C1-and-SPI-Frequency-Limit.patch"
 SRC_URI += "file://0004-Add-IRQ-7-TPS62517-PMIC.patch"
 SRC_URI += "file://0005-Add-DS1302-GPIO-DRIVER.patch"
 SRC_URI += "file://0006-invert-sdcard.patch"
+SRC_URI += "file://0007-enable-usb-ethernet-gadget.cfg"
+
