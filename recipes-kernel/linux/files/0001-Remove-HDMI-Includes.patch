@@ -1,16 +1,15 @@
 Upstream-Status: Inappropriate [oe specific] 
-
-From 9969cc632bc1554375bec30ccb9ece5eea2e099b Mon Sep 17 00:00:00 2001
-From: customer <customer@company.com>
-Date: Tue, 25 Mar 2025 20:58:54 +0000
-Subject: [PATCH] Remove-HDMI-Includes
+From a9187fc324814d55407b13ea5e83aa7791513afc Mon Sep 17 00:00:00 2001
+From: Richard Day <richard_day@highlandbiosciences.com>
+Date: Fri, 2 May 2025 12:03:07 +0100
+Subject: [PATCH] Remove-HDMI-includes
 
 ---
- arch/arm/boot/dts/ti/omap/am335x-boneblack.dts | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
+ .../arm/boot/dts/ti/omap/am335x-boneblack.dts | 34 +++++++++----------
+ 1 file changed, 17 insertions(+), 17 deletions(-)
 
 diff --git a/arch/arm/boot/dts/ti/omap/am335x-boneblack.dts b/arch/arm/boot/dts/ti/omap/am335x-boneblack.dts
-index 16b567e3cb47..1f4b11d1544a 100644
+index 16b567e3cb47..f45c7b7e288b 100644
 --- a/arch/arm/boot/dts/ti/omap/am335x-boneblack.dts
 +++ b/arch/arm/boot/dts/ti/omap/am335x-boneblack.dts
 @@ -7,7 +7,7 @@
@@ -22,3 +21,49 @@ index 16b567e3cb47..1f4b11d1544a 100644
  
  / {
  	model = "TI AM335x BeagleBone Black";
+@@ -106,26 +106,26 @@ &gpio2 {
+ 		"P8_8",
+ 		"P8_10",
+ 		"P8_9",
+-		"P8_45 [hdmi]",
+-		"P8_46 [hdmi]",
+-		"P8_43 [hdmi]",
+-		"P8_44 [hdmi]",
+-		"P8_41 [hdmi]",
+-		"P8_42 [hdmi]",
+-		"P8_39 [hdmi]",
+-		"P8_40 [hdmi]",
+-		"P8_37 [hdmi]",
+-		"P8_38 [hdmi]",
+-		"P8_36 [hdmi]",
+-		"P8_34 [hdmi]",
++		"P8_45",
++		"P8_46",
++		"P8_43",
++		"P8_44",
++		"P8_41",
++		"P8_42",
++		"P8_39",
++		"P8_40",
++		"P8_37",
++		"P8_38",
++		"P8_36",
++		"P8_34",
+ 		"[rmii1_rxd3]",
+ 		"[rmii1_rxd2]",
+ 		"[rmii1_rxd1]",
+ 		"[rmii1_rxd0]",
+-		"P8_27 [hdmi]",
+-		"P8_29 [hdmi]",
+-		"P8_28 [hdmi]",
+-		"P8_30 [hdmi]",
++		"P8_27",
++		"P8_29",
++		"P8_28",
++		"P8_30",
+ 		"[mmc0_dat3]",
+ 		"[mmc0_dat2]",
+ 		"[mmc0_dat1]",
+-- 
+2.43.0
+
