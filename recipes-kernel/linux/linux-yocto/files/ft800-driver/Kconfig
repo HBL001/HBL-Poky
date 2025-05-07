@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-2.0
+menu "FT800 SPI Display Driver"
+
+config FT800
+    tristate "Bridgetek FT800 SPI Display Controller"
+    depends on SPI
+    help
+      Select this option to enable support for the Bridgetek FT800 SPI graphics controller.
+      This driver performs low-level initialization, display timing setup, and provides
+      a /dev/ft800 character device for communicating with the FT800 co-processor
+      using ioctl().
+
+endmenu
+

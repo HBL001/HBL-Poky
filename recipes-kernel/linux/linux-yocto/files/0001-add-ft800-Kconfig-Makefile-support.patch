@@ -1,0 +1,37 @@
+Upstream-Status: Inappropriate [oe specific] 
+From a2b176b852718e8c929d38de9dbd2da06398d680 Mon Sep 17 00:00:00 2001
+From: Richard Day <richard_day@highlandbiosciences.com>
+Date: Mon, 5 May 2025 15:51:22 +0100
+Subject: [PATCH] add-ft800-Kconfig-Makefile-support
+
+---
+ drivers/Kconfig  | 2 ++
+ drivers/Makefile | 1 +
+ 2 files changed, 3 insertions(+)
+
+diff --git a/drivers/Kconfig b/drivers/Kconfig
+index efb66e25fa2d..e2054dd98fc8 100644
+--- a/drivers/Kconfig
++++ b/drivers/Kconfig
+@@ -243,4 +243,6 @@ source "drivers/hte/Kconfig"
+ 
+ source "drivers/cdx/Kconfig"
+ 
++source "drivers/ft800-driver/Kconfig"
++
+ endmenu
+diff --git a/drivers/Makefile b/drivers/Makefile
+index 1bec7819a837..4c687cd2a354 100644
+--- a/drivers/Makefile
++++ b/drivers/Makefile
+@@ -162,6 +162,7 @@ obj-$(CONFIG_HWSPINLOCK)	+= hwspinlock/
+ obj-$(CONFIG_REMOTEPROC)	+= remoteproc/
+ obj-$(CONFIG_RPMSG)		+= rpmsg/
+ obj-$(CONFIG_SOUNDWIRE)		+= soundwire/
++obj-y 				+= ft800-driver/
+ 
+ # Virtualization drivers
+ obj-$(CONFIG_VIRT_DRIVERS)	+= virt/
+-- 
+2.43.0
+

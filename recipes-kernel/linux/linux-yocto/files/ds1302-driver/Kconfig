@@ -1,0 +1,6 @@
+config RTC_DRV_DS1302_GPIO
+	tristate "Dallas DS1302 over GPIO"
+	depends on RTC_CLASS
+	default yes
+	help
+	  Support for the Dallas DS1302 RTC chips using GPIO bitbang interface.

@@ -1,0 +1,146 @@
+Upstream-Status: Inappropriate [oe specific]
+From f3339ce11d7cd26a28add9c608e6cde7b952253a Mon Sep 17 00:00:00 2001
+From: Richard Day <richard_day@highlandbiosciences.com>
+Date: Tue, 6 May 2025 22:41:17 +0100
+Subject: [PATCH] device-tree-additions
+
+---
+ .../arm/boot/dts/ti/omap/am335x-boneblack.dts | 111 +++++++++++++++++-
+ 1 file changed, 105 insertions(+), 6 deletions(-)
+
+diff --git a/arch/arm/boot/dts/ti/omap/am335x-boneblack.dts b/arch/arm/boot/dts/ti/omap/am335x-boneblack.dts
+index 16b567e3cb47..394793c17db4 100644
+--- a/arch/arm/boot/dts/ti/omap/am335x-boneblack.dts
++++ b/arch/arm/boot/dts/ti/omap/am335x-boneblack.dts
+@@ -7,7 +7,7 @@
+ #include "am33xx.dtsi"
+ #include "am335x-bone-common.dtsi"
+ #include "am335x-boneblack-common.dtsi"
+-#include "am335x-boneblack-hdmi.dtsi"
++#include <dt-bindings/pinctrl/am33xx.h>
+ 
+ / {
+ 	model = "TI AM335x BeagleBone Black";
+@@ -15,11 +15,6 @@ / {
+ };
+ 
+ &cpu0_opp_table {
+-	/*
+-	 * All PG 2.0 silicon may not support 1GHz but some of the early
+-	 * BeagleBone Blacks have PG 2.0 silicon which is guaranteed
+-	 * to support 1GHz OPP so enable it for PG 2.0 on this board.
+-	 */
+ 	opp-1000000000 {
+ 		/* OPP Nitro */
+ 		opp-supported-hw = <0x06 0x0100>;
+@@ -173,3 +168,107 @@ &gpio3 {
+ &baseboard_eeprom {
+ 	vcc-supply = <&ldo4_reg>;
+ };
++
++
++/* set cd line to ACTIVE_HIGH */
++&mmc1 {
++    cd-gpios = <&gpio0 6 GPIO_ACTIVE_HIGH>;
++};
++
++
++&am33xx_pinmux {
++    /* SPI0 for FT800 */
++    spi0_pins: spi0_pins {
++        pinctrl-single,pins = <
++            AM33XX_PADCONF(AM335X_PIN_SPI0_SCLK,  PIN_INPUT_PULLUP,  MUX_MODE0) /* P9_22 */
++            AM33XX_PADCONF(AM335X_PIN_SPI0_D0,    PIN_INPUT_PULLUP,  MUX_MODE0) /* P9_21 */
++            AM33XX_PADCONF(AM335X_PIN_SPI0_D1,    PIN_OUTPUT_PULLUP, MUX_MODE0) /* P9_18 */
++            AM33XX_PADCONF(AM335X_PIN_SPI0_CS0,   PIN_OUTPUT_PULLUP, MUX_MODE0) /* P9_17 */
++        >;
++    };
++
++    /* I²C1 on P9_26/P9_24 */
++    i2c1_pins: pinmux_i2c1_pins {
++        pinctrl-single,pins = <
++            AM33XX_PADCONF(AM335X_PIN_UART1_RXD,  PIN_INPUT_PULLUP,  MUX_MODE3) /* SDA */
++            AM33XX_PADCONF(AM335X_PIN_UART1_TXD,  PIN_INPUT_PULLUP,  MUX_MODE3) /* SCL */
++        >;
++    };
++
++    /* DS1302 GPIO-bitbang RTC */
++    ds1302_pins: pinmux_ds1302 {
++        pinctrl-single,pins = <
++            AM33XX_PADCONF(AM335X_PIN_GPMC_ADVN_ALE,   PIN_INPUT_PULLUP,  MUX_MODE7) /* CE */
++            AM33XX_PADCONF(AM335X_PIN_GPMC_OEN_REN,   PIN_INPUT_PULLUP,  MUX_MODE7) /* SCLK */
++            AM33XX_PADCONF(AM335X_PIN_GPMC_WEN,   PIN_INPUT_PULLUP,  MUX_MODE7) /* IO */
++        >;
++    };
++
++    /* BBB UART5 on LCDC_DATA8/9 for SERIAL */
++    bb_uart5_pins: pinmux_bb_uart5_pins {
++        pinctrl-single,pins = <
++            AM33XX_PADCONF(AM335X_PIN_LCD_DATA8, PIN_OUTPUT | PULL_DISABLE, MUX_MODE4) /* TXD */
++            AM33XX_PADCONF(AM335X_PIN_LCD_DATA9, PIN_INPUT  | PULL_DISABLE, MUX_MODE4) /* RXD */
++        >;
++    };
++};
++
++&spi0 {
++    	status = "okay";
++    	pinctrl-names = "default";
++    	pinctrl-0     = <&spi0_pins>;
++
++    ft800: ft800@0 {
++        compatible         = "bridgetek,ft800";
++        status = "okay";
++        reg                = <0>;
++        spi-max-frequency  = <10000000>; /* 10 MHz */
++    };
++};
++
++
++&i2c1 {
++    	status           = "okay";
++    	pinctrl-names    = "default";
++    	pinctrl-0        = <&i2c1_pins>;
++    	clock-frequency  = <100000>;
++    	#address-cells   = <1>;
++    	#size-cells      = <0>;
++};
++
++&i2c0 {
++    	tps: tps@24 {
++        compatible                   = "ti,tps65217";
++        reg                          = <0x24>;
++        interrupt-parent            = <&intc>; /* PMIC IRQ */
++        interrupts                   = <7>;
++        ti,pmic-shutdown-controller;
++    };
++};
++
++
++&ocp {
++    	rtc_ds1302_gpio: ds1302@0 {
++        compatible      = "maxim,ds1302-gpio";
++        pinctrl-names   = "default";
++        pinctrl-0       = <&ds1302_pins>;
++        ce-gpios        = <&gpio2 2 GPIO_ACTIVE_HIGH>;
++        sclk-gpios      = <&gpio2 3 GPIO_ACTIVE_HIGH>;
++        io-gpios        = <&gpio2 4 GPIO_ACTIVE_HIGH>;
++        status          = "okay";
++    };
++};
++
++&uart5 {
++    	status           = "okay";
++    	pinctrl-names    = "default";
++    	pinctrl-0        = <&bb_uart5_pins>;
++};
++
++
++
++
++
++
++
++
+-- 
+2.43.0
+
