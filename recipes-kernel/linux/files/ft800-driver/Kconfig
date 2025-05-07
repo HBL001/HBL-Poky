@@ -1,9 +1,0 @@
-config FT800_DRIVER
-    tristate "FT800 SPI Display Controller Driver"
-    depends on SPI
-    help
-      Stub driver for the Bridgetek FT800 SPI display controller.
-      This minimal implementation binds to the device tree node
-      and outputs probe/remove logs.
-
-

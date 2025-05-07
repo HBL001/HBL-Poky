@@ -1,2 +1,0 @@
-obj-$(CONFIG_FT800_DRIVER) += ft800.o
-
