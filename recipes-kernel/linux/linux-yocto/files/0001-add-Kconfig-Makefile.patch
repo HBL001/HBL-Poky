@@ -1,0 +1,37 @@
+From 0b191b7fdf8877666cbf36ee36385dee27462f0a Mon Sep 17 00:00:00 2001
+From: Richard Day <richard_day@highlandbiosciences.com>
+Date: Fri, 9 May 2025 12:32:14 +0100
+Subject: [PATCH] add-Kconfig-Makefile
+
+---
+ drivers/Kconfig  | 4 ++++
+ drivers/Makefile | 3 +++
+ 2 files changed, 7 insertions(+)
+
+diff --git a/drivers/Kconfig b/drivers/Kconfig
+index efb66e25fa2d..3c3e3b6a62ff 100644
+--- a/drivers/Kconfig
++++ b/drivers/Kconfig
+@@ -243,4 +243,8 @@ source "drivers/hte/Kconfig"
+ 
+ source "drivers/cdx/Kconfig"
+ 
++source "drivers/ft800-driver/Kconfig"
++
++source "drivers/ds1302-gpio-driver/Kconfig"
++
+ endmenu
+diff --git a/drivers/Makefile b/drivers/Makefile
+index 1bec7819a837..8f7cacbc49fd 100644
+--- a/drivers/Makefile
++++ b/drivers/Makefile
+@@ -199,3 +199,6 @@ obj-$(CONFIG_DRM_ACCEL)		+= accel/
+ obj-$(CONFIG_CDX_BUS)		+= cdx/
+ 
+ obj-$(CONFIG_S390)		+= s390/
++obj-$(CONFIG_FT800)		+= ft800-driver/
++obj-$(CONFIG_RTC_DRV_DS1302_GPIO) += ds1302-gpio-driver/
++
+-- 
+2.43.0
+

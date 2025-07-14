@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-2.0
+menu "DS1302-gpio Dallas DS1302 bit-banged support"
+
+config RTC_DRV_DS1302_GPIO
+    tristate "Dallas DS1302 GPIO bit-bang support"
+    depends on GPIOLIB && OF && OF_GPIO
+   	help
+     	 Enable the GPIO bit-banged driver for the Dallas DS1302 RTC
+     	 (uses compatible = "dallas,ds1302-gpio" in your Device Tree).
+
+endmenu
+
