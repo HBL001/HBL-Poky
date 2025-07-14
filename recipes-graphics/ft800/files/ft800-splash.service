@@ -1,0 +1,13 @@
+[Unit]
+Description=FT800 Splash Screen
+After=dev-ft800.device
+Requires=dev-ft800.device
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/ft800-splash
+StandardOutput=journal
+
+[Install]
+WantedBy=multi-user.target
+

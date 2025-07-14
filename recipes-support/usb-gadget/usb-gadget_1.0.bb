@@ -12,9 +12,7 @@ S = "${WORKDIR}"
 #-----------------------------------------------------------------------------#
 # FILESEXTRAPATHS: where BitBake looks for file:// URIs
 #-----------------------------------------------------------------------------#
-# Modern override (Yocto 3.4+); prepend our files/ directory ahead of others
 FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
-# If you ever build on pre-3.4, you’d also add FILESEXTRAPATHS_prepend (underscore).
 
 #-----------------------------------------------------------------------------#
 # Licensing: point BitBake at our LICENSE for QA checks

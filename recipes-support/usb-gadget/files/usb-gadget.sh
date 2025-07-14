@@ -5,54 +5,65 @@ set -e
 
 G=/sys/kernel/config/usb_gadget/bbb
 
-# 1) Load composite core + RNDIS function driver (built-in via CONFIG_USB_CONFIGFS_RNDIS=y)
+# 1) Load composite core + RNDIS function driver
 modprobe libcomposite
 modprobe usb_f_rndis || true
 
 # 2) Mount configfs if needed
 mountpoint -q /sys/kernel/config || mount -t configfs none /sys/kernel/config
 
-# 3) If we’ve never configured the gadget, do so now
+# 3) Build the gadget on first run
 if [ ! -d "$G" ]; then
     cd /sys/kernel/config/usb_gadget
-    mkdir -p bbb && cd bbb
+    mkdir bbb
+    cd bbb
 
-    # Device IDs (you can swap these for 1d6b:0104 if you prefer Linux Foundation defaults)
+    # Device IDs
     echo 0x0525 > idVendor
     echo 0xa4a2 > idProduct
     echo 0x0100 > bcdDevice
     echo 0x0200 > bcdUSB
 
-    # Microsoft OS descriptors (force RNDIS driver install on Windows)
+    # Microsoft OS descriptors (Windows-friendly RNDIS)
     mkdir -p os_desc
     echo 1       > os_desc/use
     echo MSFT100 > os_desc/qw_sign
     echo 0x01    > os_desc/b_vendor_code
 
-    # Human-readable strings (en-US)
+    # Descriptive strings
     mkdir -p strings/0x409
-    echo "highlandBiosciencesLtd"     > strings/0x409/manufacturer
-    echo "00000000001"        > strings/0x409/serialnumber
-    echo "frankenBeagle" > strings/0x409/product
+    echo "highlandBiosciencesLtd" > strings/0x409/manufacturer
+    echo "00000000001"             > strings/0x409/serialnumber
+    echo "frankenBeagle"           > strings/0x409/product
 
-    # Single RNDIS configuration
-    mkdir -p configs/c.1
-    echo 250 > configs/c.1/MaxPower
+    # Configuration “c.1”
+    mkdir -p configs/c.1/strings/0x409
+    echo "RNDIS network" > configs/c.1/strings/0x409/configuration
+    echo 250            > configs/c.1/MaxPower
 
-    # Create RNDIS function and bind
-    mkdir -p functions
-    mkdir    functions/rndis.usb0
+    # RNDIS function
+    mkdir -p functions/rndis.usb0
+    # (optional) set device & host MACs here:
+    # echo "5e:cd:f5:d3:0b:56" > functions/rndis.usb0/dev_addr
+    # echo "b2:d4:60:08:6d:b3" > functions/rndis.usb0/host_addr
+
     ln -s functions/rndis.usb0 configs/c.1/
 
-    # Activate the gadget
-    echo "$(ls /sys/class/udc | head -n1)" > UDC
+    # Wait for UDC to appear, then bind
+    # (sometimes UDC isn’t ready instantly)
+    UDC=""
+    while [ -z "$UDC" ]; do
+      UDC=$(ls /sys/class/udc | head -n1 || true)
+      sleep 0.1
+    done
+    echo "$UDC" > UDC
 fi
 
-# 4) Bring up the USB network interface and assign the static /30 address
+# 4) Bring up the interface & IP on every boot
 ip link set dev usb0 up
-ip addr add 192.168.7.2/30 dev usb0 || true
-ip route add default via 192.168.7.1 dev usb0
-
+ip addr flush dev usb0
+ip addr add 192.168.137.2/30 dev usb0
+ip route add default via 192.168.137.1 dev usb0 || true
 
 exit 0
 

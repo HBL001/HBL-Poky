@@ -181,7 +181,7 @@ static struct spi_driver ft800_driver = {
 
 module_spi_driver(ft800_driver);
 
-MODULE_AUTHOR("Your Name");
+MODULE_AUTHOR("Dr Richard Day");
 MODULE_DESCRIPTION("FT800 SPI Display Driver with Char Device Interface");
 MODULE_LICENSE("GPL");
 

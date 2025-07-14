@@ -1,14 +1,16 @@
-# /lib/systemd/system/usb-gadget.service — systemd unit for RNDIS gadget
+# /lib/systemd/system/usb-gadget.service
 
 [Unit]
-Description=Configure USB RNDIS gadget     
-After=local-fs.target                     
+Description=Configure USB RNDIS gadget
+# Wait for configfs to be mounted, modules to load, and "network-pre" for any ExecStartPost hooks
+Wants=sys-subsystem-configfs.mount
+After=systemd-modules-load.service sys-subsystem-configfs.mount network-pre.target
 
 [Service]
-Type=oneshot                              
-ExecStart=/usr/bin/usb-gadget.sh          
-RemainAfterExit=yes                        
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/usb-gadget.sh
 
 [Install]
-WantedBy=multi-user.target                 
+WantedBy=multi-user.target
 

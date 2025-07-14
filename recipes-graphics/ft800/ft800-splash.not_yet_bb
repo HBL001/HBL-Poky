@@ -1,0 +1,28 @@
+SUMMARY = "Early splash screen for Bridgetek FT800"
+DESCRIPTION = "Display a blue background, loading text on FT800 after /dev/ft800 is ready"
+LICENSE = "MIT"
+LIC_FILES_CHKSUM = "file://ft800-splash.c;beginline=1;endline=20;md5=<replace-me>"
+
+SRC_URI = "file://ft800-splash.c \
+           file://ft800-splash.service"
+
+S = "${WORKDIR}"
+
+DEPENDS = "virtual/libc"
+
+do_compile() {
+    ${CC} ${CFLAGS} ${LDFLAGS} -o ft800-splash ft800-splash.c
+}
+
+do_install() {
+   install -d ${D}${bindir}
+   install -m 0755 ft800-splash ${D}${bindir}/ft800-splash
+
+   install -d ${D}${systemd_system_unitdir}
+   install -m 0644 ${WORKDIR}/ft800-splash.service ${D}${systemd_system_unitdir}/ft800-splash.service
+}
+
+inherit systemd
+
+SYSTEMD_SERVICE:${PN} = "ft800-splash.service"
+
