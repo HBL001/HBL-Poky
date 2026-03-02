@@ -1,35 +1,22 @@
-# Kernel patches
+# linux-yocto_%.bbappend
+#
+# Keep kernel changes reproducible: config fragment + patch series only.
+# Do NOT stage driver source drops in do_patch (that causes drift vs git/patches).
+
 FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 
 # 1) Kernel configuration fragment
 SRC_URI += "file://extra-configs.cfg"
 KERNEL_CONFIG_FRAGMENTS += "extra-configs.cfg"
 
-# 2) Add Kconfig & Makefile support for ft800-driver
+# 2) Kernel patches (kept in sync with workspace/devtool branch)
 SRC_URI += "file://0001-add-Kconfig-Makefile.patch"
-# SRC_URI += "file://0002-device-tree-additions.patch"
+SRC_URI += "file://0002-arm-dts-am335x-boneblack-add-board-specific-device-t.patch"
+SRC_URI += "file://0003-drivers-add-ft800-driver.patch"
+SRC_URI += "file://0004-rtc-add-ds1302-GPIO-driver.patch"
+#SRC_URI += "file://0005-input-add-TPS65217-power-button-driver.patch"
 
-# 3) stub driver sources — unpack into WORKDIR
-SRC_URI += "\
-    file://ft800-driver/ft800.c \
-    file://ft800-driver/ft800.h \
-    file://ft800-driver/ft800_ioctl.c \
-    file://ft800-driver/Kconfig \
-    file://ft800-driver/Makefile \
-    file://ds1302-gpio-driver/rtc-ds1302-gpio.c \
-    file://ds1302-gpio-driver/Kconfig \
-    file://ds1302-gpio-driver/Makefile \
-    "
-
-# 4) Move the driver directories into the kernel tree
-do_patch:prepend() {
-    bbnote "Staging FT800 driver sources into ${S}/drivers/ft800-driver"
-    install -d -v ${S}/drivers/ft800-driver
-    cp -rv ${WORKDIR}/ft800-driver/* ${S}/drivers/ft800-driver/
-
-    bbnote "Staging DS1302 Dallas driver sources into ${S}/drivers/ds1302-gpio-driver"
-    install -d -v ${S}/drivers/ds1302-gpio-driver
-    cp -rv ${WORKDIR}/ds1302-gpio-driver/* ${S}/drivers/ds1302-gpio-driver/
-}
-
-
+# NOTE:
+# We intentionally do not carry any spidev patch (not used; avoid upstream drift).
+# We intentionally do not stage out-of-tree driver sources into ${S}; the patches
+# already add the driver sources and wiring into the kernel tree.
