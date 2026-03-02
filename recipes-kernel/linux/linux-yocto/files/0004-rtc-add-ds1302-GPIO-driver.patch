@@ -1,0 +1,372 @@
+Upstream-Status: Inappropriate [embedded specific]
+From 4e019ea61e1bb84cfdba74cb3b27c252a1a85c52 Mon Sep 17 00:00:00 2001
+From: Richard Day <richard_day@highlandbiosciences.com>
+Date: Sun, 1 Mar 2026 00:03:30 +0000
+Subject: [PATCH 4/6] rtc: add ds1302 GPIO driver
+
+---
+ drivers/ds1302-gpio-driver/Kconfig           |  12 +
+ drivers/ds1302-gpio-driver/Makefile          |   1 +
+ drivers/ds1302-gpio-driver/rtc-ds1302-gpio.c | 323 +++++++++++++++++++
+ 3 files changed, 336 insertions(+)
+ create mode 100644 drivers/ds1302-gpio-driver/Kconfig
+ create mode 100644 drivers/ds1302-gpio-driver/Makefile
+ create mode 100644 drivers/ds1302-gpio-driver/rtc-ds1302-gpio.c
+
+diff --git a/drivers/ds1302-gpio-driver/Kconfig b/drivers/ds1302-gpio-driver/Kconfig
+new file mode 100644
+index 000000000000..1cb135e1bb28
+--- /dev/null
++++ b/drivers/ds1302-gpio-driver/Kconfig
+@@ -0,0 +1,12 @@
++# SPDX-License-Identifier: GPL-2.0-only
++menu "DS1302-gpio Dallas DS1302 bit-banged support"
++
++config RTC_DRV_DS1302_GPIO
++    tristate "Dallas DS1302 GPIO bit-bang support"
++    depends on GPIOLIB && OF && OF_GPIO
++   	help
++     	 Enable the GPIO bit-banged driver for the Dallas DS1302 RTC
++     	 (uses compatible = "dallas,ds1302-gpio" in your Device Tree).
++
++endmenu
++
+diff --git a/drivers/ds1302-gpio-driver/Makefile b/drivers/ds1302-gpio-driver/Makefile
+new file mode 100644
+index 000000000000..399f87dddbe1
+--- /dev/null
++++ b/drivers/ds1302-gpio-driver/Makefile
+@@ -0,0 +1 @@
++obj-$(CONFIG_RTC_DRV_DS1302_GPIO)  += rtc-ds1302-gpio.o
+diff --git a/drivers/ds1302-gpio-driver/rtc-ds1302-gpio.c b/drivers/ds1302-gpio-driver/rtc-ds1302-gpio.c
+new file mode 100644
+index 000000000000..97bc3bb6668a
+--- /dev/null
++++ b/drivers/ds1302-gpio-driver/rtc-ds1302-gpio.c
+@@ -0,0 +1,323 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Dallas DS1302 RTC GPIO Support with GPIO descriptors (burst-read)
++ *
++ * Bit-bangs the DS1302 real-time clock over three GPIOs (CE, SCLK, IO)
++ * using the gpiod consumer API, and registers as /dev/rtcX.
++ *
++ * Implements the recommended “clock burst read” so all time fields
++ * are sampled under one CE assertion, avoiding rollover glitches.
++ *
++ * Copyright (C) 2025 – Highland Biosciences Ltd
++ */
++
++#include <linux/init.h>              /* __init */
++#include <linux/module.h>            /* module macros */
++#include <linux/kernel.h>            /* pr_info, etc. */
++#include <linux/platform_device.h>   /* platform_driver */
++#include <linux/rtc.h>               /* rtc_device, rtc_class_ops */
++#include <linux/gpio/consumer.h>     /* gpiod_get(), gpiod_set_value() */
++#include <linux/of.h>                /* of_match_ptr */
++#include <linux/of_device.h>         /* MODULE_DEVICE_TABLE */
++#include <linux/delay.h>             /* udelay */
++#include <linux/bcd.h>               /* bcd2bin(), bin2bcd() */
++
++#define DRV_NAME       "ds1302-gpio" /* driver name */
++#define DRV_VERSION    "0.0.1"       /* version string */
++
++/* Standard DS1302 commands and register addresses */
++#define RTC_CMD_READ        0x81    /* base read command */
++#define RTC_CMD_WRITE       0x80    /* base write command */
++
++/* We’ll still need these if we ever do byte-wise writes */
++#define RTC_CMD_WRITE_ENABLE    0x00
++#define RTC_CMD_WRITE_DISABLE   0x80
++
++/* Single-byte register addresses (for writes) */
++#define RTC_ADDR_RAM0       0x20    /* scratch RAM register for self-test */
++#define RTC_ADDR_CTRL       0x07    /* control register (write-enable) */
++#define RTC_ADDR_YEAR       0x06
++#define RTC_ADDR_MON        0x04
++#define RTC_ADDR_DATE       0x03
++#define RTC_ADDR_DAY        0x05    /* day-of-week */
++#define RTC_ADDR_HOUR       0x02
++#define RTC_ADDR_MIN        0x01
++#define RTC_ADDR_SEC        0x00
++
++/* Timing from datasheet (microseconds) */
++#define TCC_TIME_USEC   4   /* CE setup */
++#define TCH_TIME_USEC   1   /* SCLK high */
++#define TCL_TIME_USEC   1   /* SCLK low */
++#define TCWH_TIME_USEC  4   /* CE hold after clock */
++
++/*
++ * For burst-read, DS1302 uses the “Clock Burst Read” command:
++ *   cmd_byte = (0x1F << 1) | 1  → 0xBF
++ * This reads seven time registers in this order:
++ *   sec, min, hour, date, month, day-of-week, year
++ */
++#define RTC_ADDR_BURST     0x1F    /* register pointer for burst-read */
++#define RTC_BURST_LEN      7       /* number of time fields */
++
++/* Per-device data structure */
++struct ds1302_rtc_stc {
++    struct gpio_desc *gpiod_ce;    /* CE GPIO descriptor */
++    struct gpio_desc *gpiod_sclk;  /* SCLK GPIO descriptor */
++    struct gpio_desc *gpiod_io;    /* IO GPIO descriptor */
++    struct rtc_device *rtc;        /* Registered rtc_device */
++};
++
++/* --- GPIO bit-bang primitives --- */
++
++/* Configure IO line for output (drive low before tx) */
++static inline void ds1302_set_tx(struct ds1302_rtc_stc *ds)
++{
++    gpiod_direction_output(ds->gpiod_io, 0);
++}
++
++/* Configure IO line for input (release for rx) */
++static inline void ds1302_set_rx(struct ds1302_rtc_stc *ds)
++{
++    gpiod_direction_input(ds->gpiod_io);
++}
++
++/* Clock pulse: high, delay, low, delay */
++static inline void ds1302_clock(struct ds1302_rtc_stc *ds)
++{
++    gpiod_set_value(ds->gpiod_sclk, 1);
++    udelay(TCH_TIME_USEC);
++    gpiod_set_value(ds->gpiod_sclk, 0);
++    udelay(TCL_TIME_USEC);
++}
++
++/* Assert CE and wait */
++static inline void ds1302_chip_enable_on(struct ds1302_rtc_stc *ds)
++{
++    gpiod_set_value(ds->gpiod_ce, 1);
++    udelay(TCC_TIME_USEC);
++}
++
++/* Deassert CE and wait */
++static inline void ds1302_chip_enable_off(struct ds1302_rtc_stc *ds)
++{
++    gpiod_set_value(ds->gpiod_ce, 0);
++    udelay(TCWH_TIME_USEC);
++}
++
++/* Send one bit on IO */
++static inline void ds1302_txbit(struct ds1302_rtc_stc *ds, int bit)
++{
++    gpiod_set_value(ds->gpiod_io, bit ? 1 : 0);
++}
++
++/* Read one bit from IO */
++static inline int ds1302_rxbit(struct ds1302_rtc_stc *ds)
++{
++    return gpiod_get_value(ds->gpiod_io);
++}
++
++/* Send 8 LSB-first bits */
++static void ds1302_sendbits(struct ds1302_rtc_stc *ds, unsigned int val)
++{
++    int i;
++
++    ds1302_set_tx(ds);
++    for (i = 0; i < 8; i++, val >>= 1) {
++        ds1302_txbit(ds, val & 1);
++        ds1302_clock(ds);
++    }
++}
++
++/* Receive 8 LSB-first bits */
++static unsigned int ds1302_recvbits(struct ds1302_rtc_stc *ds)
++{
++    unsigned int val = 0;
++    int i;
++
++    ds1302_set_rx(ds);
++    for (i = 0; i < 8; i++) {
++        val |= ds1302_rxbit(ds) << i;
++        ds1302_clock(ds);
++    }
++    return val;
++}
++
++/* --- **New**: Read a single register byte --- */
++static unsigned int ds1302_readbyte(struct ds1302_rtc_stc *ds,
++                                    unsigned int addr)
++{
++    unsigned int val;
++
++    ds1302_chip_enable_on(ds);
++    ds1302_sendbits(ds, ((addr & 0x3f) << 1) | RTC_CMD_READ);
++    val = ds1302_recvbits(ds);
++    ds1302_chip_enable_off(ds);
++
++    return val;
++}
++
++/* Write a single register byte */
++static void ds1302_writebyte(struct ds1302_rtc_stc *ds,
++                             unsigned int addr, unsigned int val)
++{
++    ds1302_chip_enable_on(ds);
++    ds1302_sendbits(ds, ((addr & 0x3f) << 1) | RTC_CMD_WRITE);
++    ds1302_sendbits(ds, val);
++    ds1302_chip_enable_off(ds);
++}
++
++/* --- RTC core callbacks --- */
++
++/*
++ * read_time: use burst-read to grab all time fields under one CE.
++ */
++static int ds1302_rtc_read_time(struct device *dev, struct rtc_time *tm)
++{
++    struct ds1302_rtc_stc *ds = dev_get_drvdata(dev);
++    unsigned int buf[RTC_BURST_LEN];
++    int i;
++
++    /* Issue clock burst-read command (0xBF) */
++    ds1302_chip_enable_on(ds);
++    ds1302_sendbits(ds, ((RTC_ADDR_BURST & 0x3f) << 1) | RTC_CMD_READ);
++
++    /* Read sec, min, hour, date, month, day-of-week, year */
++    for (i = 0; i < RTC_BURST_LEN; i++)
++        buf[i] = ds1302_recvbits(ds);
++
++    ds1302_chip_enable_off(ds);
++
++    /* Map into rtc_time (all BCD→binary) */
++    tm->tm_sec  = bcd2bin(buf[0]);
++    tm->tm_min  = bcd2bin(buf[1]);
++    tm->tm_hour = bcd2bin(buf[2]);
++    tm->tm_mday = bcd2bin(buf[3]);
++    tm->tm_mon  = bcd2bin(buf[4]) - 1;    /* tm_mon: 0–11 */
++    tm->tm_wday = bcd2bin(buf[5]);
++    tm->tm_year = bcd2bin(buf[6]);
++    if (tm->tm_year < 70)
++        tm->tm_year += 100;               /* adjust to 20xx */
++
++    return rtc_valid_tm(tm);
++}
++
++/*
++ * set_time: identical to before, using byte-wise writes.
++ */
++static int ds1302_rtc_set_time(struct device *dev, struct rtc_time *tm)
++{
++    struct ds1302_rtc_stc *ds = dev_get_drvdata(dev);
++
++    /* Enable writes and halt clock */
++    ds1302_writebyte(ds, RTC_ADDR_CTRL, RTC_CMD_WRITE_ENABLE);
++    ds1302_writebyte(ds, RTC_ADDR_SEC,
++        ds1302_readbyte(ds, RTC_ADDR_SEC) | 0x80);
++
++    /* Write all fields */
++    ds1302_writebyte(ds, RTC_ADDR_SEC,  bin2bcd(tm->tm_sec));
++    ds1302_writebyte(ds, RTC_ADDR_MIN,  bin2bcd(tm->tm_min));
++    ds1302_writebyte(ds, RTC_ADDR_HOUR, bin2bcd(tm->tm_hour));
++    ds1302_writebyte(ds, RTC_ADDR_DATE, bin2bcd(tm->tm_mday));
++    ds1302_writebyte(ds, RTC_ADDR_MON,  bin2bcd(tm->tm_mon + 1));
++    ds1302_writebyte(ds, RTC_ADDR_DAY,  bin2bcd(tm->tm_wday));
++    ds1302_writebyte(ds, RTC_ADDR_YEAR, bin2bcd(tm->tm_year % 100));
++
++    /* Restart clock and disable writes */
++    ds1302_writebyte(ds, RTC_ADDR_SEC,
++        ds1302_readbyte(ds, RTC_ADDR_SEC) & ~0x80);
++    ds1302_writebyte(ds, RTC_ADDR_CTRL, RTC_CMD_WRITE_DISABLE);
++
++    return 0;
++}
++
++/* (Optional) Trickle-charge ioctl */
++static int ds1302_rtc_ioctl(struct device *dev,
++                            unsigned int cmd, unsigned long arg)
++{
++#ifdef RTC_SET_CHARGE
++    if (cmd == RTC_SET_CHARGE) {
++        int val;
++        struct ds1302_rtc_stc *ds = dev_get_drvdata(dev);
++        if (copy_from_user(&val, (int __user *)arg, sizeof(val)))
++            return -EFAULT;
++        ds1302_writebyte(ds, RTC_ADDR_TCR, 0xa0 | val * 0x0f);
++        return 0;
++    }
++#endif
++    return -ENOIOCTLCMD;
++}
++
++/* Hook into the RTC framework */
++static const struct rtc_class_ops ds1302_rtc_ops = {
++    .read_time = ds1302_rtc_read_time,
++    .set_time  = ds1302_rtc_set_time,
++    .ioctl     = ds1302_rtc_ioctl,
++};
++
++/* --- Probe & DT binding --- */
++
++static int ds1302_rtc_probe(struct platform_device *pdev)
++{
++    struct ds1302_rtc_stc *ds;
++
++    /* Allocate private state (automatically freed on unbind) */
++    ds = devm_kzalloc(&pdev->dev, sizeof(*ds), GFP_KERNEL);
++    if (!ds)
++        return -ENOMEM;
++
++    /* Acquire CE, SCLK, IO lines from device tree */
++    ds->gpiod_ce   = devm_gpiod_get(&pdev->dev, "ce",    GPIOD_OUT_LOW);
++    ds->gpiod_sclk = devm_gpiod_get(&pdev->dev, "sclk",  GPIOD_OUT_LOW);
++    ds->gpiod_io   = devm_gpiod_get(&pdev->dev, "io",    GPIOD_IN);
++    if (IS_ERR(ds->gpiod_ce) || IS_ERR(ds->gpiod_sclk) || IS_ERR(ds->gpiod_io))
++        return PTR_ERR(ds->gpiod_ce);
++
++    dev_info(&pdev->dev,
++             "DS1302_RTC: CE=%d, SCLK=%d, IO=%d\n",
++             desc_to_gpio(ds->gpiod_ce),
++             desc_to_gpio(ds->gpiod_sclk),
++             desc_to_gpio(ds->gpiod_io));
++
++    /* Self-test: write/read RAM0 */
++    ds1302_writebyte(ds, RTC_ADDR_RAM0, 0x42);
++    if (ds1302_readbyte(ds, RTC_ADDR_RAM0) != 0x42) {
++        dev_err(&pdev->dev, "RAM self-test failed\n");
++        return -ENODEV;
++    }
++
++    platform_set_drvdata(pdev, ds);
++
++    /* Register as an RTC device named "ds1302-gpio" */
++    ds->rtc = devm_rtc_device_register(&pdev->dev,
++                                       DRV_NAME,
++                                       &ds1302_rtc_ops,
++                                       THIS_MODULE);
++    if (IS_ERR(ds->rtc))
++        return PTR_ERR(ds->rtc);
++
++    return 0;
++}
++
++/* Device-Tree match table */
++static const struct of_device_id ds1302_dt_ids[] = {
++    { .compatible = "dallas,ds1302-gpio" },
++    { }
++};
++MODULE_DEVICE_TABLE(of, ds1302_dt_ids);
++
++/* Platform-driver registration */
++static struct platform_driver ds1302_rtc_driver = {
++    .probe = ds1302_rtc_probe,
++    .driver = {
++        .name           = DRV_NAME,
++        .of_match_table = of_match_ptr(ds1302_dt_ids),
++    },
++};
++module_platform_driver(ds1302_rtc_driver);
++
++/* Module metadata */
++MODULE_DESCRIPTION("Dallas DS1302 RTC GPIO driver (burst-read, descriptor API)");
++MODULE_VERSION(DRV_VERSION);
++MODULE_AUTHOR("Highland Biosciences Ltd");
++MODULE_LICENSE("GPL v2");
++
+--
+2.43.0
+

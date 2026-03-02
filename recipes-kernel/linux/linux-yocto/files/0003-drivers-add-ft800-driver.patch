@@ -1,0 +1,3404 @@
+Upstream-Status: Inappropriate [embedded specific]
+From 0de164b22f89c7fcb1ce3cf577d3c6bdbef1cccc Mon Sep 17 00:00:00 2001
+From: Richard Day <richard_day@highlandbiosciences.com>
+Date: Sun, 1 Mar 2026 00:03:15 +0000
+Subject: [PATCH 3/6] drivers: add ft800 driver
+
+---
+ drivers/ft800-driver/Kconfig      |   14 +
+ drivers/ft800-driver/Makefile     |    4 +
+ drivers/ft800-driver/ft800.c      | 2903 +++++++++++++++++++++++++++++
+ drivers/ft800-driver/ft800.h      |  282 +++
+ drivers/ft800-driver/ft800_uapi.h |  149 ++
+ 5 files changed, 3352 insertions(+)
+ create mode 100644 drivers/ft800-driver/Kconfig
+ create mode 100644 drivers/ft800-driver/Makefile
+ create mode 100644 drivers/ft800-driver/ft800.c
+ create mode 100644 drivers/ft800-driver/ft800.h
+ create mode 100644 drivers/ft800-driver/ft800_uapi.h
+
+diff --git a/drivers/ft800-driver/Kconfig b/drivers/ft800-driver/Kconfig
+new file mode 100644
+index 000000000000..d2af9c5c7c89
+--- /dev/null
++++ b/drivers/ft800-driver/Kconfig
+@@ -0,0 +1,14 @@
++# SPDX-License-Identifier: GPL-2.0
++menu "FT800 SPI Display Driver"
++
++config FT800
++    tristate "Bridgetek FT800 SPI Display Controller"
++    depends on SPI
++    help
++      Select this option to enable support for the Bridgetek FT800 SPI graphics controller.
++      This driver performs low-level initialization, display timing setup, and provides
++      a /dev/ft800 character device for communicating with the FT800 co-processor
++      using ioctl().
++
++endmenu
++
+diff --git a/drivers/ft800-driver/Makefile b/drivers/ft800-driver/Makefile
+new file mode 100644
+index 000000000000..bcb66013b452
+--- /dev/null
++++ b/drivers/ft800-driver/Makefile
+@@ -0,0 +1,4 @@
++# SPDX-License-Identifier: GPL-2.0
++obj-$(CONFIG_FT800) += ft800.o
++
++
+diff --git a/drivers/ft800-driver/ft800.c b/drivers/ft800-driver/ft800.c
+new file mode 100644
+index 000000000000..ea617d35f39a
+--- /dev/null
++++ b/drivers/ft800-driver/ft800.c
+@@ -0,0 +1,2903 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * ft800.c - Bridgetek FT800 / FT843 SPI driver for BeagleBone Black (4DLCD-FT843)
++ * All register addresses, timings, and DLSWAP location confirmed for your board.
++ */
++
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/compat.h>
++#include <linux/version.h>
++#include <linux/delay.h>
++#include <linux/firmware.h>
++#include <linux/fs.h>
++#include <linux/of.h>
++#include <linux/of_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++#include <video/of_display_timing.h>
++#include <video/videomode.h>
++#include <linux/interrupt.h>
++
++#include "ft800.h"
++
++/* Global pixel clock divider used by reset/init paths */
++static u8 ft800_pclk_div = 0x28U; /* default fallback */
++
++/* ---- Tunables ---- */
++static uint ft800_fifo_timeout_ms = 200;
++static uint ft800_io_chunk_size   = 4096;
++
++static const u16 fallback[14] = {
++    480, 272,    /* HSIZE / VSIZE */
++    589, 43, 2, 41,  /* HCYCLE / HOFFSET / HSYNC0 / HSYNC1 */
++    295, 5, 0, 10,  /* VCYCLE / VOFFSET / VSYNC0 / VSYNC1 */
++    0, 1,            /* SWIZZLE / CSPREAD */
++    1,               /* PCLK_POL (rising) */
++    6                /* PCLK divider (48 MHz / (5+1) ≈ 8 MHz) */
++};
++static const u32 reg16[14] = {
++    FT800_REG_HSIZE,
++    FT800_REG_VSIZE,
++    FT800_REG_HCYCLE,
++    FT800_REG_HOFFSET,
++    FT800_REG_HSYNC0,
++    FT800_REG_HSYNC1,
++    FT800_REG_VCYCLE,
++    FT800_REG_VOFFSET,
++    FT800_REG_VSYNC0,
++    FT800_REG_VSYNC1,
++    FT800_REG_SWIZZLE,
++    FT800_REG_CSPREAD,
++    FT800_REG_PCLK_POL,
++    FT800_REG_PCLK
++};
++
++
++/**
++ * ft800_rd16 - Read a 16-bit value (little-endian) from any FT800 address over SPI
++ * @ft:   Pointer to FT800 device context
++ * @addr: 24-bit target FT800 address (register, RAM_DL, RAM_CMD, etc)
++ * @val:  Pointer to 16-bit variable to store read value
++ *
++ * Validates the address range, formats an SPI read command,
++ * and issues a 16-bit read. Caller must hold the device mutex
++ * and runtime PM context.
++ *
++ * Return: 0 on success, negative errno on failure.
++ */
++static int ft800_rd16(struct ft800_dev *ft, u32 addr, u16 *val)
++{
++    u8 tx[3];
++    u8 rx[3]; /* Expect: dummy, LSB, MSB */
++    int ret;
++
++    /* Address range check */
++    if ((addr & ~FT800_ADDR_MASK) != 0U) {
++        dev_err(&ft->spi->dev,
++                "ft800_rd16: address out of range 0x%08X", addr);
++        return -EINVAL;
++    }
++
++    /* SPI read header: [A23..16][A15..8][A7..0] */
++    tx[0] = (u8)(addr >> 16);
++    tx[1] = (u8)(addr >> 8);
++    tx[2] = (u8)addr;
++
++    /* Perform SPI write-then-read */
++    ret = spi_write_then_read(ft->spi, tx, sizeof(tx), rx, sizeof(rx));
++    if (ret == 0) {
++        *val = (u16)rx[1] | ((u16)rx[2] << FT800_SHIFT_MSB);
++        dev_info(&ft->spi->dev,
++                 "ft800_rd16: addr=0x%06X rx=[%02X %02X %02X] val=0x%04X",
++                 addr, rx[0], rx[1], rx[2], *val);
++    } else {
++        dev_err(&ft->spi->dev,
++                "ft800_rd16: SPI read error addr=0x%06X ret=%d",
++                addr, ret);
++    }
++
++    return ret;
++}
++
++/**
++ * ft800_wr8 - Write an 8-bit value to any FT800 address over SPI
++ * @ft:   Pointer to FT800 device context
++ * @addr: 24-bit target FT800 address (register, RAM_DL, RAM_CMD, etc)
++ * @v:    8-bit value to write (host/endian = little-endian)
++ *
++ * Validates the address range, formats an SPI write command,
++ * and issues an 8-bit write. Caller must hold the device mutex
++ * and runtime PM context.
++ *
++ * Return: 0 on success, negative errno on failure.
++ */
++static int ft800_wr8(struct ft800_dev *ft, u32 addr, u8 v)
++{
++    u8  tx[4];
++    int ret;
++
++    /* Address range check (optional) */
++    if ((addr & ~FT800_ADDR_MASK) != 0U) {
++        dev_err(&ft->spi->dev,
++                "ft800_wr8: address out of range 0x%08X", addr);
++        return -EINVAL;
++    }
++
++    /* SPI write header: [CMD|A23..16][A15..8][A7..0] */
++    tx[0] = FT800_SPI_WR | (u8)(addr >> 16);
++    tx[1] = (u8)(addr >> 8);
++    tx[2] = (u8)addr;
++
++    /* 8-bit payload */
++    tx[3] = (u8)((v >> FT800_SHIFT_BYTE0) & 0xFFu);
++
++    /* Debug: dump the prepared buffer */
++    dev_info(&ft->spi->dev,
++             "ft800_wr8: tx=[%02X %02X %02X %02X] addr=0x%06X v=0x%02X",
++             tx[0], tx[1], tx[2], tx[3], addr, v);
++
++    /* Perform the SPI write */
++    ret = spi_write(ft->spi, tx, sizeof(tx));
++    if (ret) {
++        dev_err(&ft->spi->dev,
++                "ft800_wr8: SPI write failed addr=0x%06X v=0x%02X ret=%d",
++                addr, v, ret);
++    }
++
++    return ret;
++}
++
++
++/**
++ * ft800_rd8 - Read an 8-bit value (lower byte) from any FT800 address over SPI
++ * @ft:   Pointer to FT800 device context
++ * @addr: 24-bit target FT800 address (register, RAM_DL, RAM_CMD, etc)
++ * @v:    Pointer to 8-bit variable to store read value
++ *
++ * Validates the address range, reads 16 bits via ft800_rd16,
++ * and returns the least-significant byte. Caller must hold
++ * the device mutex and runtime PM context.
++ *
++ * Return: 0 on success, negative errno on failure.
++ */
++static int ft800_rd8(struct ft800_dev *ft, u32 addr, u8 *v)
++{
++    u16 tmp;
++    int ret;
++
++    /* Address range check */
++    if ((addr & ~FT800_ADDR_MASK) != 0U) {
++        dev_err(&ft->spi->dev,
++                "ft800_rd8: address out of range 0x%08X", addr);
++        return -EINVAL;
++    }
++
++    /* Read 16 bits (LSB contains desired byte) */
++    ret = ft800_rd16(ft, addr, &tmp);
++    if (ret) {
++        dev_err(&ft->spi->dev,
++                "ft800_rd8: rd16 failed addr=0x%06X ret=%d", addr, ret);
++        return ret;
++    }
++
++    *v = (u8)((tmp >> FT800_SHIFT_BYTE0) & 0xFFu);
++
++    /* Debug: report the extracted byte */
++    dev_info(&ft->spi->dev,
++             "ft800_rd8: addr=0x%06X tmp=0x%04X => v=0x%02X", addr, tmp, *v);
++
++    return 0;
++}
++
++/**
++ * ft800_wr16 - Write a 16-bit value to any FT800 address over SPI
++ * @ft:   Pointer to FT800 device context
++ * @addr: 24-bit target FT800 address (register, RAM_DL, RAM_CMD, etc)
++ * @v:    16-bit value to write (host/endian = little-endian)
++ *
++ * Validates the address range, formats an SPI write command,
++ * and issues a 16-bit write. Caller must hold the device mutex
++ * and runtime PM context.
++ *
++ * Return: 0 on success, negative errno on failure.
++ */
++static int ft800_wr16(struct ft800_dev *ft, u32 addr, u16 v)
++{
++    u8  tx[5];
++    int ret;
++
++    /* Address range check (optional) */
++    if ((addr & ~FT800_ADDR_MASK) != 0U) {
++        dev_err(&ft->spi->dev,
++                "ft800_wr16: address out of range 0x%08X", addr);
++        return -EINVAL;
++    }
++
++    /* SPI write header: [CMD|A23..16][A15..8][A7..0] */
++    tx[0] = FT800_SPI_WR | (u8)(addr >> 16);
++    tx[1] = (u8)(addr >> 8);
++    tx[2] = (u8)addr;
++
++    /* 16-bit payload (little-endian) */
++    tx[3] = (u8)((v >> FT800_SHIFT_LSB) & 0xFFu);
++    tx[4] = (u8)((v >> FT800_SHIFT_MSB) & 0xFFu);
++
++    /* Debug: dump the prepared buffer */
++    dev_info(&ft->spi->dev,
++             "ft800_wr16: tx=[%02X %02X %02X %02X %02X] addr=0x%06X v=0x%04X",
++             tx[0], tx[1], tx[2], tx[3], tx[4], addr, v);
++
++    /* Perform the SPI write */
++    ret = spi_write(ft->spi, tx, sizeof(tx));
++    if (ret) {
++        dev_err(&ft->spi->dev,
++                "ft800_wr16: SPI write failed addr=0x%06X v=0x%04X ret=%d",
++                addr, v, ret);
++    }
++
++    return ret;
++}
++
++/**
++ * ft800_wr32 - Write a 32-bit value to any FT800 address over SPI
++ * @ft:     Pointer to FT800 device context
++ * @addr:   24-bit target FT800 address (register, RAM_DL, RAM_CMD, etc)
++ * @val:    32-bit value to write (host endian)
++ * @endian: FT800_BE or FT800_LE to specify byte order
++ *
++ * Writes a 32-bit value to the given address in FT800 address space.
++ * The caller must hold the device mutex and enable runtime PM.
++ *
++ * Return: 0 on success, negative errno on failure.
++ */
++static int ft800_wr32(struct ft800_dev *ft, u32 addr, u32 val, u8 endian)
++{
++    u8 tx[7];
++    int ret;
++
++    /* Check for valid FT800 address (optional) */
++    if ((addr & ~FT800_ADDR_MASK) != 0U) {
++        dev_err(&ft->spi->dev, "ft800_wr32: Address out of range 0x%08X", addr);
++        return -EINVAL;
++    }
++
++    /* Check for valid endian flag */
++    if (endian != FT800_LE && endian != FT800_BE) {
++        dev_err(&ft->spi->dev, "ft800_wr32: Invalid endian: %u", endian);
++        return -EINVAL;
++    }
++
++    /* Format the SPI write header */
++    tx[0] = FT800_SPI_WR | (u8)(addr >> 16);  /* Command + addr[23:16] */
++    tx[1] = (u8)(addr >> 8);                  /* addr[15:8] */
++    tx[2] = (u8)addr;                         /* addr[7:0] */
++
++    /* Format the data based on endian */
++    if (endian == FT800_BE) {
++        tx[3] = (val >> 24) & 0xFF;
++        tx[4] = (val >> 16) & 0xFF;
++        tx[5] = (val >> 8)  & 0xFF;
++        tx[6] = val & 0xFF;
++    } else {
++        tx[3] = val & 0xFF;
++        tx[4] = (val >> 8)  & 0xFF;
++        tx[5] = (val >> 16) & 0xFF;
++        tx[6] = (val >> 24) & 0xFF;
++    }
++
++    dev_info(&ft->spi->dev,
++        "ft800_wr32: SPI tx=[%02X %02X %02X %02X %02X %02X %02X] (addr=0x%06X val=0x%08X endian=%s)",
++        tx[0], tx[1], tx[2], tx[3], tx[4], tx[5], tx[6],
++        addr, val, (endian == FT800_BE) ? "BE" : "LE");
++
++    /* Perform the SPI write */
++    ret = spi_write(ft->spi, tx, sizeof(tx));
++    if (ret) {
++        dev_err(&ft->spi->dev,
++            "ft800_wr32: SPI write failed: addr=0x%06X val=0x%08X ret=%d",
++            addr, val, ret);
++    }
++
++    return ret;
++}
++
++/* ------------------------------------------------------------------ */
++/*  ft800_read_bulk() – plain-PIO block-read (dummy byte discarded)   */
++static int ft800_read_bulk(struct ft800_dev * const ft,
++                           u32                      addr,
++                           void *                   buf,
++                           size_t                   len)
++{
++        struct spi_transfer xfer[3] = { { 0 } };
++        struct spi_message  msg;
++        u8                  hdr[3];
++        const u8            dummy_tx = 0x00u;  /* clocks the dummy     */
++        u8                  dummy_rx = 0x00u;  /* thrown away          */
++
++        /* ---------- sanity ----------------------------------------- */
++        if ((buf == NULL) || (len == 0u) ||
++            (len > sizeof(((struct ft800_mem_op *)0)->data)))
++                return -EINVAL;
++
++        if (!((addr >= FT800_RAM_G_START   &&
++               (addr + len) <= FT800_RAM_G_START   + FT800_RAM_G_SIZE)     ||
++              (addr >= FT800_RAM_DL_START  &&
++               (addr + len) <= FT800_RAM_DL_START  + FT800_RAM_DL_SIZE)    ||
++              (addr >= FT800_REG_START     &&
++               (addr + len) <= FT800_REG_START     + FT800_REG_SIZE)       ||
++              (addr >= FT800_RAM_CMD_START &&
++               (addr + len) <= FT800_RAM_CMD_START + FT800_CMD_FIFO_SIZE)))
++                return -EINVAL;
++
++        /* ---------- build 3-byte READ header (bit7 = 0) ------------- */
++        hdr[0] = (u8)((addr >> 16) & 0x3Fu);   /* RD flag already 0    */
++        hdr[1] = (u8)(addr >> 8);
++        hdr[2] = (u8) addr;
++
++        spi_message_init(&msg);
++
++        /* ① send header – ignore whatever comes back                  */
++        xfer[0].tx_buf = hdr;
++        xfer[0].len    = sizeof hdr;
++        spi_message_add_tail(&xfer[0], &msg);
++
++        /* ② one dummy byte (TX constant, RX thrown away)              */
++        xfer[1].tx_buf = &dummy_tx;
++        xfer[1].rx_buf = &dummy_rx;
++        xfer[1].len    = 1u;
++        spi_message_add_tail(&xfer[1], &msg);
++
++        /* ③ receive the real payload                                  */
++        xfer[2].rx_buf = buf;
++        xfer[2].len    = len;
++        spi_message_add_tail(&xfer[2], &msg);
++
++        return spi_sync(ft->spi, &msg);
++}
++
++
++/**
++ * ft800_copro_write32 - Write a 32-bit value to the FT800 coprocessor FIFO
++ * @ft:  Pointer to FT800 device context
++ * @val: 32-bit command to enqueue (host endian = little-endian)
++ *
++ * Calculates the next FIFO address using the software write index,
++ * writes the 32-bit value via SPI, advances the write_index with wrap-around,
++ * and updates the hardware CMD_WRITE register (FT800_REG_CMD_WRITE).
++ * Caller must hold the device mutex and runtime PM context.
++ *
++ * Return: 0 on success, negative errno on failure.
++ */
++static int ft800_copro_write32(struct ft800_dev *ft, u32 val)
++{
++    u32 addr;
++    int ret;
++
++    /* Compute FIFO write address */
++    addr = FT800_RAM_CMD + ft->write_index;
++
++    /* Write 32-bit command (little-endian) */
++    ret = ft800_wr32(ft, addr, val, FT800_LE);
++    if (ret) {
++        dev_err(&ft->spi->dev,
++                "ft800_copro_write32: wr32 failed addr=0x%06X val=0x%08X ret=%d",
++                addr, val, ret);
++        return ret;
++    }
++
++    /* Advance software write index with wrap-around */
++    ft->write_index = (ft->write_index + sizeof(u32)) % FT800_CMD_FIFO_SIZE;
++
++    /* Update hardware write pointer (16-bit) */
++    ret = ft800_wr16(ft, FT800_REG_CMD_WRITE, (u16)ft->write_index);
++    if (ret) {
++        dev_err(&ft->spi->dev,
++                "ft800_copro_write32: update CMD_WRITE failed idx=0x%04X ret=%d",
++                ft->write_index, ret);
++        return ret;
++    }
++
++    /* Log successful coprocessor enqueue */
++    dev_info(&ft->spi->dev,
++             "ft800_copro_write32: val=0x%08X next_index=0x%04X",
++             val, ft->write_index);
++
++    return 0;
++}
++
++/**
++ * ft800_copro_write - Write a multi-word buffer to the FT800 coprocessor FIFO
++ * @ft:   Pointer to FT800 device context
++ * @buf:  Buffer of data to write (must be 4-byte aligned and len multiple of 4)
++ * @len:  Number of bytes to write
++ *
++ * Validates buffer alignment and length, then writes each 32-bit word
++ * in little-endian order to FT800_RAM_CMD at the current write_index,
++ * advancing the software and hardware write pointers after each word.
++ * Caller must hold the device mutex and runtime PM context.
++ *
++ * Return: 0 on success, negative errno on failure.
++ */
++static int ft800_copro_write(struct ft800_dev *ft, const void *buf, size_t len)
++{
++    size_t i;
++    const u8 *p = buf;
++    u32 addr;
++    int ret;
++
++    /* Validate length (must be multiple of 4) */
++    if ((len % sizeof(u32)) != 0U) {
++        dev_err(&ft->spi->dev,
++                "ft800_copro_write: length not multiple of 4 (%zu)", len);
++        return -EINVAL;
++    }
++
++    /* Validate buffer alignment (4-byte) */
++    if (((uintptr_t)buf & (sizeof(u32) - 1U)) != 0U) {
++        dev_err(&ft->spi->dev,
++                "ft800_copro_write: buffer not 4-byte aligned %p", buf);
++        return -EINVAL;
++    }
++
++    /* Initial FIFO write address */
++    addr = FT800_RAM_CMD + ft->write_index;
++
++    for (i = 0U; i < len; i += sizeof(u32)) {
++        u32 tmp;
++
++        /* Copy next 32-bit word from buffer */
++        memcpy(&tmp, &p[i], sizeof(tmp));
++
++        /* Write the word to FIFO */
++        ret = ft800_wr32(ft, addr, tmp, FT800_LE);
++        if (ret) {
++            dev_err(&ft->spi->dev,
++                    "ft800_copro_write: wr32 failed addr=0x%06X val=0x%08X ret=%d",
++                    addr, tmp, ret);
++            return ret;
++        }
++
++        /* Debug: log each word written */
++        dev_info(&ft->spi->dev,
++                 "ft800_copro_write: RAM_CMD[0x%06X] <= 0x%08X (word %zu/%zu)",
++                 addr, tmp, (i / sizeof(u32)) + 1U, (len / sizeof(u32)));
++
++        /* Advance software write index with wrap-around */
++        ft->write_index = (ft->write_index + sizeof(u32)) % FT800_CMD_FIFO_SIZE;
++        addr = FT800_RAM_CMD + ft->write_index;
++
++        /* Update hardware write pointer (16-bit) */
++        ret = ft800_wr16(ft, FT800_REG_CMD_WRITE, (u16)ft->write_index);
++        if (ret) {
++            dev_err(&ft->spi->dev,
++                    "ft800_copro_write: update CMD_WRITE failed idx=0x%04X ret=%d",
++                    ft->write_index, ret);
++            return ret;
++        }
++    }
++
++    return 0;
++}
++
++/**
++ * ft800_wait_cmd_fifo_empty - wait for FT800 co-processor FIFO to drain (with debug)
++ * @ft:         pointer to ft800_dev
++ * @timeout_ms: timeout in milliseconds
++ *
++ * Polls REG_CMD_READ until it equals the software write_index, indicating
++ * that the co-processor has consumed all enqueued commands.
++ *
++ * Return: 0 on success, -ETIMEDOUT on timeout, or negative errno on error.
++ */
++static int ft800_wait_cmd_fifo_empty(struct ft800_dev *ft,
++                                     unsigned long timeout_ms)
++{
++    u16             cmd_read = 0;
++    u16             widx     = ft->write_index;
++    unsigned long   deadline = jiffies + msecs_to_jiffies(timeout_ms);
++    int             tries    = 0;
++    int             ret;
++
++    dev_info(&ft->spi->dev,
++        "ft800_wait_cmd_fifo_empty: Enter, want REG_CMD_READ=0x%04X (write_index)", widx);
++
++    do {
++        ret = ft800_rd16(ft, FT800_REG_CMD_READ, &cmd_read);
++        ++tries;
++
++        if (ret) {
++            dev_err(&ft->spi->dev,
++                "ft800_wait_cmd_fifo_empty: read CMD_READ failed: %d", ret);
++            return ret;
++        }
++
++        if (tries == 1 || (tries % 10) == 0) {
++            dev_info(&ft->spi->dev,
++                "ft800_wait_cmd_fifo_empty: poll %d: CMD_READ=0x%04X, want=0x%04X",
++                tries, cmd_read, widx);
++        }
++
++        if (cmd_read == widx) {
++            dev_info(&ft->spi->dev,
++                "ft800_wait_cmd_fifo_empty: FIFO drained in %d polls", tries);
++            return 0;
++        }
++
++        usleep_range(500, 1000);
++
++    } while (time_before(jiffies, deadline));
++
++    dev_warn(&ft->spi->dev,
++        "ft800_wait_cmd_fifo_empty: TIMEOUT after %d tries! Final CMD_READ=0x%04X, want=0x%04X",
++        tries, cmd_read, widx);
++
++    return -ETIMEDOUT;
++}
++
++/**
++ * ft800_wait_fifo - wait until FT800 command FIFO has enough free space
++ * @ft:   FT800 device pointer
++ * @need: number of bytes needed in FIFO (4-byte aligned)
++ *
++ * Caller must hold ft->lock and have done pm_runtime_get_sync().
++ *
++ * Return: 0 on success, -ETIMEDOUT if timeout, -EIO on SPI error, -EINVAL on bad args.
++ */
++static int ft800_wait_fifo(struct ft800_dev *ft, u32 need)
++{
++    u16            rd = 0U;
++    u16            wr = 0U;
++    u32            fullness;
++    u32            free_space;
++    unsigned long  deadline;
++
++    /* must be nonzero, 4-byte aligned, and not exceed total FIFO */
++    if (need == 0U || (need % 4U) != 0U || need > FT800_CMD_FIFO_SIZE) {
++        dev_err(&ft->spi->dev,
++                "ft800_wait_fifo: bad need=%u\n", need);
++        return -EINVAL;
++    }
++
++    /* set timeout point */
++    deadline = jiffies + msecs_to_jiffies(ft800_fifo_timeout_ms);
++
++    /* poll until we have at least `need` bytes free, reserving 4 bytes as sentinel */
++    while (time_before(jiffies, deadline)) {
++        int ret;
++
++        ret  = ft800_rd16(ft, FT800_REG_CMD_READ,  &rd);
++        ret |= ft800_rd16(ft, FT800_REG_CMD_WRITE, &wr);
++        if (ret) {
++            dev_err(&ft->spi->dev,
++                    "ft800_wait_fifo: read error: %d\n", ret);
++            return -EIO;
++        }
++
++        /* calculate how many bytes are outstanding in the FIFO */
++        if (wr >= rd)
++            fullness = (u32)(wr - rd);
++        else
++            fullness = (u32)wr + FT800_CMD_FIFO_SIZE - rd;
++
++        /*
++         * Reserve 4 bytes so hardware can distinguish full vs empty:
++         * available = (FIFO_SIZE - 4) - fullness
++         */
++        free_space = (FT800_CMD_FIFO_SIZE - 4U) - fullness;
++
++        if (free_space >= need)
++            return 0;
++
++        usleep_range(500, 1000);
++    }
++
++    dev_warn(&ft->spi->dev,
++             "ft800_wait_fifo: timeout rd=0x%04X wr=0x%04X free=%u need=%u\n",
++             rd, wr, free_space, need);
++    return -ETIMEDOUT;
++}
++
++/**
++ * Issues a display list swap at the next vertical blank, then
++ * blocks until DLSWAP clears or timeout (~100 ms) elapses.
++ *
++ * @ft: Pointer to ft800_dev
++ * Return:
++ *   0 on success (swap issued and acknowledged),
++ *   -ETIMEDOUT if DLSWAP didn’t clear in time,
++ *   or negative errno from SPI/I²C operations.
++ */
++static int ft800_dlswap_frame(struct ft800_dev *ft)
++{
++    int ret;
++    unsigned long deadline;
++    u8 reg;
++
++    /* 1) Kick off the swap */
++    ret = ft800_wr8(ft, FT800_REG_DLSWAP, DLSWAP_FRAME);
++    if (ret < 0)
++        return ret;
++
++    /* 2) Wait for DLSWAP → 0 (max ~100 ms) */
++    deadline = jiffies + msecs_to_jiffies(100);
++    do {
++        ret = ft800_rd8(ft, FT800_REG_DLSWAP, &reg);
++        if (ret < 0) {
++            dev_err(&ft->spi->dev,
++                    "ft800_dlswap: failed read DLSWAP: %d\n", ret);
++            return ret;
++        }
++        if (reg == 0)
++            return 0;  /* swap complete */
++
++        /* sleep roughly one frame (60 Hz) */
++        msleep(16);
++    } while (time_before(jiffies, deadline));
++
++    dev_warn(&ft->spi->dev,
++             "ft800_dlswap: timeout waiting for DLSWAP clear (0x%02X)\n",
++             reg);
++    return -ETIMEDOUT;
++}
++
++/**
++ * ft800_set_gpio_outputs - Assert DISP/Backlight/AMP_EN early
++ * @ft: FT800 device pointer
++ *
++ * Sets GPIO direction and output registers for DISP pin (GPIO7).
++ */
++static int ft800_set_gpio_outputs(struct ft800_dev *ft)
++{
++    int ret;
++
++    /* Configure GPIO7 as output (0x82) */
++    ret = ft800_wr8(ft, FT800_REG_GPIO_DIR, 0x82U);
++    if (ret < 0) {
++        dev_err(&ft->spi->dev, "ft800: FT800_REG_GPIO_DIR write failed: %d\n", ret);
++        return ret;
++    }
++
++    /* Set GPIO7 (DISP) high */
++    ret = ft800_wr8(ft, FT800_REG_GPIO, 0x82U);
++    if (ret < 0) {
++        dev_err(&ft->spi->dev, "ft800: FT800_REG_GPIO write failed: %d\n", ret);
++        return ret;
++    }
++
++    dev_info(&ft->spi->dev, "ft800: DISP asserted (GPIO7)\n");
++    return 0;
++}
++
++/**
++ * ft800_host_cmd - Send a host command (3 bytes) to FT800
++ * @ft: FT800 device pointer
++ * @cmd: Command byte
++ *
++ * Caller must hold mutex and runtime PM.
++ */
++static int ft800_host_cmd(struct ft800_dev *ft, u8 cmd)
++{
++    u8 tx[3] = { cmd, 0, 0 };
++    return spi_write(ft->spi, tx, sizeof(tx));
++}
++
++/**
++ * ft800_valid_mem_region() - Validate FT800 memory access region
++ * @ft: FT800 device context
++ * @addr: starting address of access
++ * @len: number of bytes requested
++ *
++ * Checks whether a given memory region falls within one of the valid
++ * FT800 memory ranges (RAM_CMD, RAM_DL, RAM_G, or registers),
++ * and is 4-byte aligned.
++ *
++ * Return: true if region is valid, false otherwise.
++ */
++bool ft800_valid_mem_region(struct ft800_dev *ft, u32 addr, size_t len)
++{
++    if (len == 0) {
++        dev_err(&ft->spi->dev, "ft800_valid_mem_region: len is zero\n");
++        return false;
++    }
++
++    if ((addr + len) > FT800_MAX_MEM) {
++        dev_err(&ft->spi->dev,
++            "ft800_valid_mem_region: region 0x%06lx..0x%06lx exceeds FT800_MAX_MEM=0x%06lx\n",
++            (unsigned long)addr,
++            (unsigned long)(addr + len),
++            (unsigned long)FT800_MAX_MEM);
++        return false;
++    }
++
++    if (!(FT800_IS_REG(addr, len) ||
++          FT800_IS_RAM_DL(addr, len) ||
++          FT800_IS_RAM_CMD(addr, len) ||
++          FT800_IS_RAM_G(addr, len))) {
++        dev_err(&ft->spi->dev,
++            "ft800_valid_mem_region: region 0x%06lx..0x%06lx not in any allowed memory window\n",
++            (unsigned long)addr,
++            (unsigned long)(addr + len - 1));
++        return false;
++    }
++
++    if ((addr & 3U) != 0 || (len & 3U) != 0) {
++        dev_err(&ft->spi->dev,
++            "ft800_valid_mem_region: addr 0x%06lx or len %lu not 4-byte aligned\n",
++            (unsigned long)addr, (unsigned long)len);
++        return false;
++    }
++
++    dev_dbg(&ft->spi->dev,
++        "ft800_valid_mem_region: region 0x%06lx..0x%06lx valid\n",
++        (unsigned long)addr,
++        (unsigned long)(addr + len - 1));
++    return true;
++}
++
++/**
++ * ft800_write_bulk() – Write a block of data to FT800 memory using PIO only.
++ *
++ * Uses a 3-byte SPI header + chunked payloads for reliable transfer.
++ * Only the PIO path is supported. All errors are logged.
++ */
++static int ft800_write_bulk(struct ft800_dev * const ft,
++                            u32 addr,
++                            const void *buf,
++                            size_t len)
++{
++    if (!ft || !buf || len == 0U) {
++        pr_err("ft800_write_bulk: Invalid argument(s): ft=%p buf=%p len=%zu\n", ft, buf, len);
++        return -EINVAL;
++    }
++
++    if ((addr & ~FT800_ADDR_MASK) != 0U) {
++        dev_err(&ft->spi->dev, "ft800_write_bulk: bad addr 0x%08X\n", addr);
++        return -EINVAL;
++    }
++
++    if (!((addr >= FT800_RAM_G_START   && (addr + len) <= FT800_RAM_G_START   + FT800_RAM_G_SIZE)     ||
++          (addr >= FT800_RAM_DL_START  && (addr + len) <= FT800_RAM_DL_START  + FT800_RAM_DL_SIZE)    ||
++          (addr >= FT800_REG_START     && (addr + len) <= FT800_REG_START     + FT800_REG_SIZE)       ||
++          (addr >= FT800_RAM_CMD_START && (addr + len) <= FT800_RAM_CMD_START + FT800_CMD_FIFO_SIZE))) {
++        pr_err("ft800_write_bulk: Address/range check failed: addr=0x%08X len=%zu\n", addr, len);
++        return -EINVAL;
++    }
++
++    const bool in_cmd_fifo = (addr >= FT800_RAM_CMD_START);
++    const u16 wp_start = ft->write_index;
++    const size_t chunk_max = 32U; // Reasonable SPI FIFO chunk size
++
++    const u8 *src = buf;
++    size_t todo = len;
++    int ret = 0;
++
++    while (todo > 0U) {
++        const size_t chunk = (todo > chunk_max) ? chunk_max : todo;
++
++        pr_debug("ft800_write_bulk: loop: todo=%zu chunk=%zu addr=0x%06X src=%p\n",
++                 todo, chunk, addr, src);
++
++        /* 3-byte SPI header */
++        u8 hdr[3] = {
++            (u8)(FT800_SPI_WR | ((addr >> 16) & 0x7FU)),
++            (u8)(addr >> 8),
++            (u8)addr
++        };
++
++        struct spi_transfer x[2] = { { 0 } };
++        struct spi_message m;
++        spi_message_init(&m);
++
++        x[0].tx_buf = hdr;
++        x[0].len    = sizeof hdr;
++        spi_message_add_tail(&x[0], &m);
++
++        x[1].tx_buf = src;
++        x[1].len    = chunk;
++        spi_message_add_tail(&x[1], &m);
++
++        ret = spi_sync(ft->spi, &m);
++
++        if (ret != 0) {
++            dev_err(&ft->spi->dev,
++                    "ft800_write_bulk: SPI error %d @0x%06X len=%zu\n",
++                    ret, addr, chunk);
++            return ret;
++        }
++
++        addr += (u32)chunk;
++        src  += chunk;
++        todo -= chunk;
++    }
++
++    /* CMD_WRITE update when writing RAM_CMD */
++    if (in_cmd_fifo) {
++        const u16 new_wp =
++            (u16)((wp_start + (u16)len) & (FT800_CMD_FIFO_SIZE - 1U));
++        ft->write_index = new_wp;
++        ret = ft800_wr16(ft, FT800_REG_CMD_WRITE, new_wp);
++        if (ret != 0) {
++            dev_err(&ft->spi->dev,
++                    "ft800_write_bulk: CMD_WRITE update failed (%d)\n",
++                    ret);
++        }
++    }
++
++    pr_debug("ft800_write_bulk: DONE, ret=%d\n", ret);
++    return ret;
++}
++
++/**
++ * ft800_parse_dt_timings - enqueue a raw byte buffer into FT800 FT800_RAM_CMD FIFO
++**/
++static int ft800_parse_dt_timings(struct device *d, u16 *o)
++{
++    struct display_timings *disp;
++    const struct display_timing *ptr;
++    struct display_timing dt;
++    struct videomode vm;
++
++    dev_info(d, "Parsing display-timings from device tree\n");
++
++    disp = of_get_display_timings(d->of_node);
++    if (!disp) {
++        dev_warn(d, "No <display-timings> node found, using fallback\n");
++        return -ENODEV;
++    }
++
++    ptr = display_timings_get(disp, 0);
++    if (!ptr) {
++        dev_warn(d, "display_timings_get() failed, using fallback\n");
++        return -EINVAL;
++    }
++
++    memcpy(&dt, ptr, sizeof(dt));
++    videomode_from_timing(&dt, &vm);
++
++    // Horizontal
++    o[0] = vm.hactive;                                             // REG_HSIZE
++    o[2] = vm.hactive + vm.hfront_porch + vm.hback_porch + vm.hsync_len; // REG_HCYCLE
++    o[3] = vm.hsync_len + vm.hback_porch;                         // REG_HOFFSET
++    o[4] = vm.hback_porch;                                        // REG_HSYNC0
++    o[5] = vm.hsync_len;                                          // REG_HSYNC1
++
++    // Vertical
++    o[1] = vm.vactive;                                             // REG_VSIZE
++    o[6] = vm.vactive + vm.vfront_porch + vm.vback_porch + vm.vsync_len; // REG_VCYCLE
++    o[7] = vm.vsync_len + vm.vback_porch;                         // REG_VOFFSET
++    o[8] = vm.vback_porch;                                        // REG_VSYNC0
++    o[9] = vm.vsync_len;                                          // REG_VSYNC1
++
++    // Other
++    o[10] = 0;  // REG_SWIZZLE
++    o[11] = 1;  // REG_CSPREAD
++    o[12] = 1;  // REG_PCLK_POL
++
++    if (!vm.pixelclock)
++        return -EINVAL;
++
++    {
++        u32 divisor = DIV_ROUND_CLOSEST(48000000U, vm.pixelclock);
++        if (divisor < 1 || divisor > 255)
++            return -EINVAL;
++        o[13] = (u16)divisor;
++    }
++
++    dev_info(d,
++        "Display timings: hactive=%u vactive=%u hfp=%u hbp=%u hsync=%u vfp=%u vbp=%u vsync=%u pixelclock=%lu Hz (PCLK=div %u)\n",
++        vm.hactive, vm.vactive,
++        vm.hfront_porch, vm.hback_porch, vm.hsync_len,
++        vm.vfront_porch, vm.vback_porch, vm.vsync_len,
++        vm.pixelclock, o[13]);
++
++    return 0;
++}
++
++/**
++ * ft800_touch_read() - Poll the FT800 for current touch state
++ * @ft: Pointer to FT800 device context
++ *
++ * Reads the latest resistive touch coordinates, pressure (RZ), and
++ * active object tag from the FT800 touch controller registers. This
++ * function reads:
++ *
++ *   • `REG_TOUCH_SCREEN_XY`   – 32-bit packed X/Y coordinates
++ *   • `REG_TOUCH_RZ`          – pressure/resistance (0xFFFF = no touch)
++ *   • `REG_TOUCH_TAG`         – tag value from the display list
++ *
++ * If no touch is detected (`RZ == 0xFFFF`), `touch_x` and `touch_y`
++ * are set to 0xFFFF to indicate invalid/no contact. Otherwise, the
++ * X/Y values are extracted from the 14-bit touch coordinates.
++ *
++ * The tag is updated only if its register read succeeds.
++ *
++ * Return: 0 on success, or -EIO on read failure.
++ */
++static int ft800_touch_read(struct ft800_dev *ft)
++{
++    u16 lo, hi, rz, tag16;
++    int ret;
++
++    ret  = ft800_rd16(ft, FT800_REG_TOUCH_SCREEN_XY,     &lo);
++    ret |= ft800_rd16(ft, FT800_REG_TOUCH_SCREEN_XY + 2, &hi);
++    if (ret)
++        return -EIO;
++
++    if (ft800_rd16(ft, FT800_REG_TOUCH_RZ, &rz))
++        return -EIO;
++
++    if (rz == 0xFFFF) {
++        ft->touch_x = 0xFFFF;
++        ft->touch_y = 0xFFFF;
++    } else {
++        u32 xy      = ((u32)hi << 16) | lo;
++        ft->touch_x = (u16)(xy & 0x3FFF);
++        ft->touch_y = (u16)((xy >> 16) & 0x3FFF);
++    }
++
++    if (!ft800_rd16(ft, FT800_REG_TOUCH_TAG, &tag16))
++        ft->touch_tag = (u8)tag16;
++
++    return 0;
++}
++
++/**
++ * ft800_llseek - support file positioning with lseek()
++ * @file:  file structure
++ * @off:   offset
++ * @whence: SEEK_SET, SEEK_CUR, SEEK_END
++ *
++ * Returns new file position or -EINVAL on error
++ */
++static loff_t ft800_llseek(struct file *file, loff_t off, int whence)
++{
++    loff_t new_pos;
++
++    switch (whence) {
++    case SEEK_SET:
++        new_pos = off;
++        break;
++    case SEEK_CUR:
++        new_pos = file->f_pos + off;
++        break;
++    case SEEK_END:
++        new_pos = FT800_MAX_MEM + off;
++        break;
++    default:
++        return -EINVAL;
++    }
++
++    if ((new_pos < 0LL) || (new_pos > FT800_MAX_MEM)) {
++        return -EINVAL;
++    }
++
++    file->f_pos = new_pos;
++    return new_pos;
++}
++
++/**
++ * ft800_read - Read from FT800 memory over SPI
++ * @file:  File pointer
++ * @ubuf:  Userspace destination buffer
++ * @count: Number of bytes to read
++ * @ppos:  File position (FT800 memory address)
++ *
++ * Returns number of bytes read, 0 (EOF), or negative errno.
++ */
++static ssize_t ft800_read(struct file *file,
++                          char __user *ubuf,
++                          size_t count,
++                          loff_t *ppos)
++{
++    struct ft800_dev *ft = file->private_data;
++    loff_t pos = *ppos;
++    size_t todo, done = 0;
++    u8 *buf = NULL;
++    int ret = 0;
++
++    if (!ft)
++        return -ENODEV;
++
++    if (count == 0)
++        return 0;
++
++    if (pos >= FT800_MAX_MEM)
++        return 0; /* EOF */
++
++    /* Clamp to prevent overflow */
++    todo = min(count, (size_t)(FT800_MAX_MEM - pos));
++
++    /* Check address is legal */
++    if (!ft800_valid_mem_region(ft,(u32)pos, todo))
++        return -EINVAL;
++
++    buf = kmalloc(ft800_io_chunk_size + 3, GFP_KERNEL);
++    if (!buf)
++        return -ENOMEM;
++
++    while (todo) {
++        size_t blk = min(todo, (size_t)ft800_io_chunk_size);
++        u8 hdr[3] = {
++            (u8)(pos >> 16),
++            (u8)(pos >> 8),
++            (u8)pos
++        };
++
++        mutex_lock(&ft->lock);
++        pm_runtime_get_sync(&ft->spi->dev);
++
++        ret = spi_write_then_read(ft->spi, hdr, 3, buf, blk + 1);
++
++        pm_runtime_put_sync(&ft->spi->dev);
++        mutex_unlock(&ft->lock);
++
++        if (ret) {
++            dev_err(&ft->spi->dev, "ft800_read: SPI read failed at 0x%06llX\n", pos);
++            break;
++        }
++
++        if (copy_to_user(ubuf + done, buf + 1, blk)) {
++            ret = -EFAULT;
++            break;
++        }
++
++        dev_dbg(&ft->spi->dev, "ft800_read: read %zu bytes @0x%06llX\n", blk, pos);
++
++        pos  += blk;
++        done += blk;
++        todo -= blk;
++    }
++
++    kfree(buf);
++    *ppos = pos;
++    return ret ? ret : (ssize_t)done;
++}
++
++
++/**
++ * ft800_spi_set_speed() - Set or update the SPI clock frequency
++ * @spi: Pointer to the FT800 SPI device
++ * @hz:  Desired SPI bus clock frequency in Hertz (must be ≤ 30 MHz)
++ *
++ * Updates the `spi->max_speed_hz` field and re-applies the configuration
++ * via `spi_setup()`. This helper is used to switch between low-speed
++ * communication (≤ 11 MHz during boot/reset) and high-speed operation
++ * (up to 30 MHz after PLL is set to CLK48M).
++ *
++ * If the requested clock rate is already set, the function returns 0
++ * immediately without reconfiguring the bus. Invalid clock rates are
++ * rejected with `-EINVAL`.
++ *
++ * Return: 0 on success, or a negative -errno from `spi_setup()` on failure.
++ */
++int ft800_spi_set_speed(struct spi_device *spi, u32 hz)
++{
++	int ret;
++
++	if (!spi)
++		return -EINVAL;
++
++	/* Sanity-check: FT800 datasheet allows up to 30 MHz after CLK48M */
++	if (!hz || hz > 30 * 1000 * 1000) {
++		dev_warn(&spi->dev, "FT800: spi_set_speed: invalid Hz value (%u)\n", hz);
++		return -EINVAL;
++	}
++
++	/* Nothing to do? */
++	if (spi->max_speed_hz == hz) {
++		dev_info(&spi->dev, "FT800: spi_set_speed: already at %u Hz\n", hz);
++		return 0;
++	}
++
++	dev_info(&spi->dev, "FT800: spi_set_speed: changing SPI clock from %u Hz to %u Hz\n",
++	         spi->max_speed_hz, hz);
++
++	spi->max_speed_hz = hz;
++
++	ret = spi_setup(spi);
++	if (ret)
++		dev_err(&spi->dev, "FT800: spi_set_speed: spi_setup(%u Hz) failed (%d)\n", hz, ret);
++	else
++		dev_info(&spi->dev, "FT800: spi_set_speed: SPI clock set to %u Hz\n", hz);
++
++	return ret;
++}
++/**
++ * ft800_hw_boot() - Hardware-reboot the FT800 core, clock, and PCLK
++ * @ft: driver-private FT800 context (provides spi + register helpers)
++ *
++ * Sequence:
++ *   1. Send CORERST       – synchronous reset
++ *   2. Send ACTIVE        – leave power-fdown / sleep
++ *   3. Send CLKEXT        – select crystal / ext-clock
++ *   4. Send CLK48M        – switch PLL to 48 MHz
++ *   5. Write REG_PCLK = 0 – gate LCD pixel clock
++ *
++ * This function assumes the caller has already acquired ft->lock.
++ * Timing delays follow FTDI application notes. Runtime-PM is used
++ * around each SPI transaction. The first error encountered is returned.
++ *
++ * Return: 0 on success, or a negative errno from low-level SPI helpers.
++ */
++int ft800_hw_boot(struct ft800_dev *ft)
++{
++	int rc = 0; /* first error wins */
++
++#define BOOT_ERR_STEP(step)                                        \
++	do {                                                       \
++		if (rc) {                                          \
++			dev_err(&ft->spi->dev,                       \
++			        "hw_boot: step %s failed (%d)\n",    \
++			        step, rc);                          \
++			goto out;                                   \
++		}                                                  \
++	} while (0)
++
++	dev_info(&ft->spi->dev, "ft800_hw_boot: sending FT800_HOST_CORERST\n");
++	rc = ft800_host_cmd(ft, FT800_HOST_CORERST);
++	BOOT_ERR_STEP("CORERST");
++	msleep(20);
++
++	dev_info(&ft->spi->dev, "ft800_hw_boot: sending FT800_HOST_ACTIVE\n");
++	rc = ft800_host_cmd(ft, FT800_HOST_ACTIVE);
++	BOOT_ERR_STEP("ACTIVE");
++	msleep(20);
++
++	dev_info(&ft->spi->dev, "ft800_hw_boot: sending FT800_HOST_CLKEXT\n");
++	rc = ft800_host_cmd(ft, FT800_HOST_CLKEXT);
++	BOOT_ERR_STEP("CLKEXT");
++	usleep_range(2000, 3000);
++
++	dev_info(&ft->spi->dev, "ft800_hw_boot: sending FT800_HOST_CLK48M\n");
++	rc = ft800_host_cmd(ft, FT800_HOST_CLK48M);
++	BOOT_ERR_STEP("CLK48M");
++	msleep(20);
++
++	dev_info(&ft->spi->dev, "ft800_hw_boot: writing REG_PCLK = 0\n");
++	rc = ft800_wr8(ft, FT800_REG_PCLK, 0);
++	BOOT_ERR_STEP("PCLK-off");
++	usleep_range(2000, 3000);
++
++out:
++	dev_info(&ft->spi->dev, "ft800_hw_boot: completed (rc = %d)\n", rc);
++	return rc;
++
++#undef BOOT_ERR_STEP
++}
++
++/**
++ * ft800_read_id() - Read and verify the FT800 silicon-ID (0x7C)
++ * @ft: driver-private FT800 context
++ * @id: (optional) place to store the raw ID byte on success
++ *
++ * The helper powers the core (runtime-PM), takes the per-device mutex,
++ * reads FT800_REG_ID and *verifies* that it matches the expected value
++ * 0x7C.  Callers therefore get a single “ready / not-an-FT800” return
++ * value.
++ *
++ * Return:
++ *   0           – success and the chip really is an FT800 (ID == 0x7C)
++ *   -ENODEV     – register read succeeded but ID != 0x7C
++ *   <negative>  – an underlying bus / PM / mutex error
++ */
++int ft800_read_id(struct ft800_dev *ft, u8 *id)
++{
++	u8   tmp  = 0;
++	int  rc;
++
++	if (WARN_ON(!ft))
++		return -EINVAL;
++
++	dev_info(&ft->spi->dev, "FT800: read_id: starting ID read sequence\n");
++
++	rc = ft800_rd8(ft, FT800_REG_ID, &tmp);
++
++	if (rc) {
++		dev_err(&ft->spi->dev, "FT800: read_id: failed to read REG_ID (%d)\n", rc);
++		return rc;               /* bus/read error */
++	}
++
++	dev_info(&ft->spi->dev, "FT800: read_id: REG_ID returned 0x%02x\n", tmp);
++
++	if (tmp != 0x7CU) {
++		dev_err(&ft->spi->dev, "FT800: read_id: unexpected chip ID (expected 0x7C)\n");
++		return -ENODEV;
++	}
++
++	if (id)
++		*id = tmp;
++
++	dev_info(&ft->spi->dev, "FT800: read_id: chip ID verified as 0x7C (OK)\n");
++
++	return 0;
++}
++/**
++ * ft800_write_timings() - Configure FT800 display timing registers
++ * @ft:   Pointer to FT800 device context
++ * @tbl:  Pointer to a 14-element array of 16-bit timing values
++ *
++ * Writes a sequence of timing values to the FT800’s LCD interface timing
++ * registers, in the order defined by the internal `reg16[]` address table.
++ * These registers configure horizontal/vertical sync widths, front/back porch,
++ * pixel clock, and display resolution parameters.
++ *
++ * This function is typically called during `probe()` after verifying the
++ * device ID and before enabling the display list or pixel clock. It ensures
++ * the FT800 is runtime-powered and locked before the register writes.
++ *
++ * Callers must pass an array of exactly 14 timing values (as produced by
++ * `ft800_parse_dt_timings()` or the fallback default).
++ *
++ * Return: 0 on success, or the first negative -errno on SPI failure.
++ */
++int ft800_write_timings(struct ft800_dev *ft, const u16 *tbl)
++{
++	int i, rc = 0;
++
++	if (WARN_ON(!ft || !tbl))
++		return -EINVAL;
++
++	dev_info(&ft->spi->dev, "FT800: write_timings: starting LCD timing configuration\n");
++
++	for (i = 0; i < ARRAY_SIZE(reg16) - 1; i++) {
++		dev_info(&ft->spi->dev, "FT800: write_timings: writing reg 0x%04x = 0x%04x\n",
++		         reg16[i], tbl[i]);
++		rc = ft800_wr16(ft, reg16[i], tbl[i]);
++		if (rc) {
++			dev_err(&ft->spi->dev, "FT800: write_timings: failed to write reg 0x%04x (%d)\n",
++			        reg16[i], rc);
++			break;
++		}
++	}
++
++	if (!rc)
++		dev_info(&ft->spi->dev, "FT800: write_timings: all timing registers written successfully\n");
++
++	return rc;
++}
++
++/**
++ * ft800_touch_init() – configure the on-chip resistive-touch controller
++ * @ft:   FT800 device context
++ *
++ * The FT800 touch engine needs two basic parameters before it can be used:
++ *  • REG_TOUCH_MODE      – acquisition mode (frame-sync, continuous, …)
++ *  • REG_TOUCH_RZTHRESH – pressure threshold that qualifies as “pen-down”
++ *
++ * For most projects a frame-synchronised acquisition (value 0x02) together
++ * with an R-Z threshold of ≈1200 Ω provides a good balance between latency,
++ * power and noise immunity.  These are exactly the settings the original
++ * probe() hard-coded, so the helper reproduces that sequence verbatim.
++ *
++ * Return: 0 on success or a negative errno propagated from the register
++ *         write helpers.
++ */
++int ft800_touch_init(struct ft800_dev *ft)
++{
++	int rc;
++
++	if (WARN_ON(!ft))
++		return -EINVAL;
++
++	dev_info(&ft->spi->dev, "FT800: touch_init: starting touch configuration\n");
++
++	dev_info(&ft->spi->dev, "FT800: touch_init: setting REG_TOUCH_MODE = 0x02 (FRAME-SYNC)\n");
++	rc  = ft800_wr8(ft, FT800_REG_TOUCH_MODE, 0x02U);
++	if (rc)
++		dev_err(&ft->spi->dev, "FT800: touch_init: failed to write REG_TOUCH_MODE (%d)\n", rc);
++
++	dev_info(&ft->spi->dev, "FT800: touch_init: setting REG_TOUCH_RZTHRESH = 1200\n");
++	rc |= ft800_wr16(ft, FT800_REG_TOUCH_RZTHRESH, 1200U);
++	if (rc)
++		dev_err(&ft->spi->dev, "FT800: touch_init: failed to write REG_TOUCH_RZTHRESH (%d)\n", rc);
++
++	if (!rc)
++		dev_info(&ft->spi->dev, "FT800: touch_init: completed successfully\n");
++
++	return rc;
++}
++
++
++/**
++ * ft800_pwm_init() - Configure FT800 PWM for TFT backlight brightness
++ * @ft: Pointer to FT800 device context
++ *
++ * Initializes the FT800's internal PWM generator, typically connected to
++ * the LCD backlight control circuit. This function sets a 500 Hz carrier
++ * frequency via `REG_PWM_HZ` and enables 100% brightness by writing `0x80`
++ * (128/128) to `REG_PWM_DUTY`.
++ *
++ * The FT800's PWM controller supports 0–128 duty cycles and frequencies from
++ * 250 Hz to 10 kHz. This helper uses fixed settings suitable for most TFTs.
++ *
++ * The function acquires the device mutex and ensures the FT800 is runtime-powered.
++ *
++ * Return: 0 on success, or negative -errno on SPI or power management failure.
++ */
++int ft800_pwm_init(struct ft800_dev *ft)
++{
++	int rc;
++
++	if (WARN_ON(!ft))
++		return -EINVAL;
++
++	dev_info(&ft->spi->dev, "FT800: pwm_init: setting REG_PWM_HZ = 500 Hz\n");
++	rc  = ft800_wr16(ft, FT800_REG_PWM_HZ, 0x01F4U); /* 500 Hz */
++	if (rc)
++		dev_err(&ft->spi->dev, "FT800: pwm_init: failed to write REG_PWM_HZ (%d)\n", rc);
++
++	dev_info(&ft->spi->dev, "FT800: pwm_init: setting REG_PWM_DUTY = 128 (100%% brightness)\n");
++	rc |= ft800_wr8(ft, FT800_REG_PWM_DUTY, 0x80U);  /* 100% duty cycle */
++	if (rc)
++		dev_err(&ft->spi->dev, "FT800: pwm_init: failed to write REG_PWM_DUTY (%d)\n", rc);
++
++	if (!rc)
++		dev_info(&ft->spi->dev, "FT800: pwm_init: completed successfully\n");
++
++	return rc;
++}
++
++/**
++ * ft800_classify_addr - Classify a register address region (DL, RAM_CMD, etc)
++ * @addr:   FT800 physical address
++ * @nbytes: Access size in bytes
++ *
++ * Return: enum ft800_mem_region
++ */
++int ft800_classify_addr(u32 addr, size_t nbytes)
++{
++    /* RAM_DL: display list RAM */
++    if (addr >= FT800_RAM_DL_START &&
++        (addr + nbytes) <= (FT800_RAM_DL_START + FT800_RAM_DL_SIZE)) {
++        return FT800_REGION_DL;
++    }
++    /* RAM_CMD: command FIFO */
++    if (addr >= FT800_RAM_CMD_START &&
++        (addr + nbytes) <= (FT800_RAM_CMD_START + FT800_RAM_CMD_SIZE)) {
++        return FT800_REGION_RAM_CMD;
++    }
++    /* RAM_G: graphics RAM */
++    if (addr >= FT800_RAM_G_START &&
++        (addr + nbytes) <= (FT800_RAM_G_START + FT800_RAM_G_SIZE)) {
++        return FT800_REGION_RAM_G;
++    }
++    /* REG: register area */
++    if (addr >= FT800_REG_START &&
++        (addr + nbytes) <= (FT800_REG_START + FT800_REG_SIZE)) {
++        return FT800_REGION_REG;
++    }
++    /* Otherwise: fallthrough */
++    return FT800_REGION_OTHER;
++}
++
++/**
++ * ft800_write - Write raw data to FT800 memory over SPI
++ * @file: file pointer
++ * @u:     Userspace buffer
++ * @count: Number of bytes to write
++ * @ppos:  File position (FT800 memory offset)
++ *
++ * Writes user-supplied data directly into FT800 memory space.
++ * Only RAM_DL, FT800_RAM_CMD, and RAM_G regions are writable.
++ * For FT800_RAM_CMD writes, this will reserve FIFO space, write circularly,
++ * update the software write_index, and poke FT800_REG_CMD_WRITE.
++ *
++ * Returns number of bytes written, or negative errno.
++ */
++static ssize_t ft800_write(struct file *file,
++                           const char __user *u,
++                           size_t count,
++                           loff_t *ppos)
++{
++    struct ft800_dev *ft = file->private_data;
++    loff_t            pos = *ppos;
++    size_t            todo, done = 0;
++    int               ret = 0;
++
++    if (!ft)
++        return -ENODEV;
++    if (count == 0)
++        return 0;
++    if (pos >= FT800_MAX_MEM)
++        return -ENOSPC;
++
++    todo = min(count, (size_t)(FT800_MAX_MEM - pos));
++    if (!ft800_valid_mem_region(ft, (u32)pos, todo))
++        return -EINVAL;
++
++    /* Check if writing into the command FIFO region */
++    if (ft800_classify_addr((u32)pos, todo) == FT800_REGION_RAM_CMD) {
++        /* Bulk-write in FIFO-safe manner, in chunks */
++        while (todo > 0) {
++            size_t chunk = min(todo, (size_t)ft800_io_chunk_size);
++            u8    *kbuf  = kmalloc(chunk, GFP_KERNEL);
++
++            if (!kbuf) {
++                ret = -ENOMEM;
++                break;
++            }
++            if (copy_from_user(kbuf, u + done, chunk)) {
++                kfree(kbuf);
++                ret = -EFAULT;
++                break;
++            }
++
++            /* Reserve FIFO space */
++            ret = ft800_wait_fifo(ft, (u32)chunk);
++            if (ret) {
++                kfree(kbuf);
++                break;
++            }
++
++            /* Write and advance our ring buffer pointer */
++            ret = ft800_write_bulk(ft, (u32)pos, kbuf, chunk);
++            kfree(kbuf);
++            if (ret)
++                break;
++
++            done += chunk;
++            pos  += chunk;
++            todo -= chunk;
++        }
++
++        *ppos = pos;
++        return ret ? ret : (ssize_t)done;
++    }
++
++    /* Non-FIFO regions: write raw SPI with 3-byte header + data */
++    {
++        size_t rem = todo;
++        u8    *buf = kmalloc(3 + ft800_io_chunk_size, GFP_KERNEL);
++        if (!buf)
++            return -ENOMEM;
++
++        while (rem > 0) {
++            size_t blk = min(rem, (size_t)ft800_io_chunk_size);
++
++            /* Construct 3-byte FT800 write header */
++            buf[0] = FT800_SPI_WR | (u8)(pos >> 16);
++            buf[1] = (u8)(pos >> 8);
++            buf[2] = (u8)pos;
++
++            if (copy_from_user(buf + 3, u + done, blk)) {
++                ret = -EFAULT;
++                break;
++            }
++
++            mutex_lock(&ft->lock);
++            pm_runtime_get_sync(&ft->spi->dev);
++
++            ret = spi_write(ft->spi, buf, 3 + blk);
++
++            pm_runtime_put_sync(&ft->spi->dev);
++            mutex_unlock(&ft->lock);
++
++            if (ret) {
++                dev_err(&ft->spi->dev,
++                        "ft800_write: SPI transfer failed @0x%06llX: %d\n",
++                        pos, ret);
++                break;
++            }
++
++            dev_dbg(&ft->spi->dev,
++                    "ft800_write: wrote %zu bytes @0x%06llX\n", blk, pos);
++
++            done += blk;
++            pos  += blk;
++            rem  -= blk;
++        }
++
++        kfree(buf);
++        *ppos = pos;
++        return ret ? ret : (ssize_t)done;
++    }
++}
++
++/**
++ * ft800_get_status - Return FIFO status to userspace
++ * @ft: driver context
++ * @arg: userspace pointer to ft800_status
++ *
++ * Return: 0 on success, -errno on failure
++ */
++int ft800_get_status(struct ft800_dev *ft, void __user *arg)
++{
++    struct ft800_status st = {0};
++    int ret;
++
++    mutex_lock(&ft->lock);
++
++    ret = ft800_rd16(ft, FT800_REG_CMD_READ, &st.cmd_read);
++    if (ret < 0) {
++        goto out;
++    }
++
++    ret = ft800_rd16(ft, FT800_REG_CMD_WRITE, &st.cmd_write);
++    if (ret < 0) {
++        goto out;
++    }
++
++    ret = ft800_rd8(ft, FT800_REG_ID, &st.id);
++
++out:
++    mutex_unlock(&ft->lock);
++
++    if (ret == 0) {
++        if (copy_to_user(arg, &st, sizeof(st)) != 0) {
++            ret = -EFAULT;
++        }
++    }
++
++    return ret;
++}
++
++/**
++ * ft800_write_mem() - Write a block of memory to FT800 address space
++ * @ft:   Pointer to FT800 device context
++ * @addr: FT800 memory address to begin writing (e.g., RAM_G or RAM_CMD)
++ * @buf:  Pointer to source data buffer
++ * @len:  Number of bytes to write
++ *
++ * Writes a contiguous block of memory to the FT800 using SPI burst mode.
++ * This helper validates arguments and dispatches to the low-level
++ * bulk transfer routine. It does not acquire the device lock or
++ * perform power management; callers must ensure the FT800 is active.
++ *
++ * Common use cases include uploading bitmap data, font tables, or
++ * display list fragments directly into RAM_G or RAM_CMD.
++ *
++ * Return: 0 on success, or negative -errno on failure.
++ */
++static int ft800_write_mem(struct ft800_dev *ft,
++                           u32 addr,
++                           const u8 *buf,
++                           size_t len)
++{
++    if (!ft || !buf || len == 0)
++        return -EINVAL;
++
++    return ft800_write_bulk(ft, addr, buf, len);
++}
++
++/**
++ * ft800_read_mem() - Read a block of memory from FT800 address space
++ * @ft:   Pointer to FT800 device context
++ * @addr: FT800 memory address to begin reading (e.g., RAM_G, RAM_CMD, registers)
++ * @buf:  Pointer to destination buffer to store the read data
++ * @len:  Number of bytes to read
++ *
++ * Reads a contiguous block of memory from the FT800 using SPI burst mode.
++ * This helper validates arguments and delegates to the low-level
++ * `ft800_read_bulk()` implementation. It does not acquire the device lock or
++ * manage runtime power — callers are responsible for ensuring the device is active.
++ *
++ * Common usage includes reading back image data, verifying memory contents,
++ * or retrieving co-processor status from RAM_CMD.
++ *
++ * Return: 0 on success, or negative -errno on failure.
++ */
++static int ft800_read_mem(struct ft800_dev *ft, u32 addr, u8 *buf, size_t len)
++{
++    if (!ft || !buf || len == 0)
++        return -EINVAL;
++
++    return ft800_read_bulk(ft, addr, buf, len);
++}
++
++/**
++ * ft800_cmd_enqueue_raw - Enqueue a raw byte buffer into FT800 RAM_CMD FIFO
++ * @ft:     FT800 device context
++ * @data:   Pointer to buffer (must be 4-byte aligned)
++ * @nbytes: Number of bytes (must be multiple of 4)
++ *
++ * Copies @nbytes from @data into the FT800 command FIFO, wrapping at
++ * FT800_RAM_CMD + FT800_CMD_FIFO_SIZE.  Updates internal write_index
++ * and writes it to FT800_REG_CMD_WRITE.
++ *
++ * Return: 0 on success;
++ *         -EINVAL on NULL pointers, zero length, or non-aligned length;
++ *         negative errno on SPI/I/O error.
++ */
++static int ft800_cmd_enqueue_raw(struct ft800_dev * const ft,
++                                 const void        * const data,
++                                 const size_t       nbytes)
++{
++    const size_t word_size = sizeof(u32);
++    const u16    fifo_size = (u16)FT800_CMD_FIFO_SIZE;
++    const u32    base_addr = FT800_RAM_CMD;
++    u16          widx;
++    const u8    *buf;
++    size_t       off;
++    int          ret = 0;
++
++    if (ft == NULL) {
++        pr_warn("ft800_cmd_enqueue_raw: NULL ft pointer\n");
++        return -EINVAL;
++    }
++    if (data == NULL) {
++        dev_warn(&ft->spi->dev, "ft800_cmd_enqueue_raw: NULL data pointer\n");
++        return -EINVAL;
++    }
++    if ((nbytes == 0U) || ((nbytes % word_size) != 0U)) {
++        dev_warn(&ft->spi->dev,
++                 "ft800_cmd_enqueue_raw: nbytes=%zu not 4-byte aligned or zero\n",
++                 nbytes);
++        return -EINVAL;
++    }
++
++    /* Start from the saved write_index */
++    widx = ft->write_index;
++    buf  = (const u8 *)data;
++
++    for (off = 0U; off < nbytes; off += word_size) {
++        u32 word;
++        u32 addr;
++
++        /* Copy next 32-bit chunk */
++        memcpy(&word, buf + off, word_size);
++
++        /* Wrap if writing this word would exceed FIFO size */
++        if ((widx + word_size) > fifo_size) {
++            widx = 0U;
++        }
++
++        addr = base_addr + widx;
++        dev_dbg(&ft->spi->dev,
++                "ft800_cmd_enqueue_raw: addr=0x%06lx, word=0x%08x\n",
++                (unsigned long)addr, word);
++
++        ret = ft800_wr32(ft, addr, word, FT800_LE);
++        if (ret < 0) {
++            dev_err(&ft->spi->dev,
++                    "ft800_cmd_enqueue_raw: wr32 failed at 0x%06lx: %d\n",
++                    (unsigned long)addr, ret);
++            return ret;
++        }
++
++        widx = (u16)(widx + word_size);
++    }
++
++    /* Commit new write_index to FT800 and to ft->write_index */
++    ft->write_index = widx;
++    ret = ft800_wr16(ft, FT800_REG_CMD_WRITE, widx);
++    if (ret < 0) {
++        dev_err(&ft->spi->dev,
++                "ft800_cmd_enqueue_raw: wr16 CMD_WRITE failed: %d\n",
++                ret);
++    }
++
++    return ret;
++}
++
++static int ft800_enqueue_copro_cmds(struct ft800_dev *ft,
++                                    const u32       *cmd,
++                                    size_t           nwords,
++                                    const char      *str)
++{
++    size_t     i;
++    u32        bytes;
++    size_t     slen   = 0U;
++    u32        pad    = 0U;
++    u8        *buf    = NULL;
++    u8        *p      = NULL;
++    int        ret;
++    struct device *dev = &ft->spi->dev;
++
++    if (ft == NULL || cmd == NULL || nwords < 1U) {
++        dev_err(dev, "enqueue_copro: invalid arguments (ft=%p cmd=%p n=%zu)\n", ft, cmd, nwords);
++        return -EINVAL;
++    }
++
++    dev_dbg(dev, "enqueue_copro: preparing %zu command words\n", nwords);
++
++    bytes = (u32)(nwords * sizeof(u32));
++
++    if (str) {
++        slen = strnlen(str, 255U);
++        if (slen > 255U) {
++            dev_err(dev, "enqueue_copro: string too long (>%u)\n", 255);
++            return -EINVAL;
++        }
++        pad   = (u32)((slen + 1U + 3U) & ~3U);
++        bytes = bytes + pad;
++        dev_dbg(dev, "enqueue_copro: string='%s' len=%zu pad=%u total=%u\n",
++                str, slen, pad - (slen + 1U), bytes);
++    } else {
++        dev_dbg(dev, "enqueue_copro: no string\n");
++    }
++
++    buf = kmalloc(bytes, GFP_KERNEL);
++    if (!buf) {
++        dev_err(dev, "enqueue_copro: kmalloc(%u) failed\n", bytes);
++        return -ENOMEM;
++    }
++
++    p = buf;
++    for (i = 0U; i < nwords; ++i) {
++        u32 w = cmd[i];
++        memcpy(p, &w, sizeof(w));
++        dev_dbg(dev, "enqueue_copro: cmd[%02zu] = 0x%08X\n", i, w);
++        p += sizeof(w);
++    }
++
++    if (str) {
++        memcpy(p, str, slen + 1U);
++        p += slen + 1U;
++
++        if (pad > (slen + 1U)) {
++            memset(p, 0U, pad - (slen + 1U));
++            dev_dbg(dev, "enqueue_copro: added %u pad bytes\n", pad - (slen + 1U));
++        }
++    }
++
++    mutex_lock(&ft->lock);
++    pm_runtime_get_sync(dev);
++
++    ret = ft800_wait_fifo(ft, bytes);
++    if (ret < 0) {
++        dev_err(dev, "enqueue_copro: wait_fifo(%u) failed → %d\n", bytes, ret);
++        goto out_free;
++    }
++
++    ret = ft800_cmd_enqueue_raw(ft, buf, bytes);
++    if (ret < 0) {
++        dev_err(dev, "enqueue_copro: enqueue_raw failed → %d\n", ret);
++        goto out_free;
++    }
++
++    ret = ft800_wait_cmd_fifo_empty(ft, ft800_fifo_timeout_ms);
++    if (ret < 0) {
++        dev_err(dev, "enqueue_copro: wait_cmd_fifo_empty timeout → %d\n", ret);
++        goto out_free;
++    }
++
++    ret = ft800_dlswap_frame(ft);
++    if (ret < 0) {
++        dev_warn(dev, "enqueue_copro: dlswap_frame() returned %d\n", ret);
++    }
++
++    dev_dbg(dev, "enqueue_copro: complete, %u bytes submitted\n", bytes);
++
++out_free:
++    pm_runtime_put_sync(dev);
++    mutex_unlock(&ft->lock);
++    kfree(buf);
++    return ret;
++}
++
++static int ft800_serialize_cmds(struct ft800_dev * const       ft,
++                                const struct ft800_cmd * const cmds,
++                                const size_t                   count)
++{
++	int ret;
++	size_t i;
++	size_t len, total, written, idx;
++	u32 packed, w;
++	size_t total_bytes = 0U;
++	struct device *dev = ft->dev;
++
++	if ((ft == NULL) || (cmds == NULL) || (count == 0U)) {
++		dev_err(dev, "serialize: invalid args (ft=%p, cmds=%p, count=%zu)\n",
++		        ft, cmds, count);
++		return -EINVAL;
++	}
++
++	for (i = 0U; i < count; ++i) {
++		const struct ft800_cmd * const cmd = &cmds[i];
++		const u32 opcode = cmd->cmd;
++		size_t cmd_bytes = 0U;
++
++		dev_dbg(dev, "serialize[%zu]: cmd=0x%08X\n", i, opcode);
++
++		/* First word: opcode */
++		ret = ft800_copro_write32(ft, opcode);
++		if (ret < 0)
++			return dev_err_probe(dev, ret, "serialize: write opcode 0x%08X failed\n", opcode);
++		cmd_bytes += 4;
++
++		switch (opcode) {
++		case CMD_TEXT:
++		case CMD_BUTTON:
++		case CMD_KEYS: {
++			/* XY position */
++			packed = ((u32)cmd->x) | (((u32)cmd->y) << 16U);
++			ret = ft800_copro_write32(ft, packed);
++			if (ret < 0) return ret;
++			cmd_bytes += 4;
++
++			/* Optional width/height */
++			if (opcode != CMD_TEXT) {
++				packed = ((u32)cmd->w) | (((u32)cmd->h) << 16U);
++				ret = ft800_copro_write32(ft, packed);
++				if (ret < 0) return ret;
++				cmd_bytes += 4;
++			}
++
++			/* Font/option */
++			if (opcode == CMD_TEXT) {
++				packed = ((u32)cmd->font) | (((u32)cmd->options) << 8U);
++				dev_dbg(dev, "serialize[%zu]: CMD_TEXT font=%u opt=0x%02X packed=0x%08X\n",
++				        i, cmd->font, cmd->options, packed);
++			} else {
++				packed = ((u32)cmd->font) | (((u32)cmd->options) << 16U);
++				dev_dbg(dev, "serialize[%zu]: font=%u opt=0x%04X packed=0x%08X\n",
++				        i, cmd->font, cmd->options, packed);
++			}
++			ret = ft800_copro_write32(ft, packed);
++			if (ret < 0)
++				return dev_err_probe(dev, ret, "serialize[%zu]: font/opt write failed\n", i);
++			cmd_bytes += 4;
++
++			/* String argument (same logic for all 3 cmds) */
++			len = strnlen(cmd->text, sizeof(cmd->text));
++			if (len == sizeof(cmd->text)) {
++				dev_err(dev, "serialize[%zu]: string not null-terminated!\n", i);
++				return -EINVAL;
++			}
++
++			total = len + 1U;  // include null terminator
++			written = 0U;
++			while (written < total) {
++				w = 0U;
++				for (idx = 0U; (idx < 4U) && ((written + idx) < total); ++idx)
++					w |= ((u32)(u8)cmd->text[written + idx]) << (8U * idx);
++				ret = ft800_copro_write32(ft, w);
++				if (ret < 0) return ret;
++				written += idx;
++				cmd_bytes += 4;
++			}
++			break;
++		}
++
++		case CMD_NUMBER:
++			packed = ((u32)cmd->x) | (((u32)cmd->y) << 16U);
++			ret = ft800_copro_write32(ft, packed);
++			if (ret < 0) return ret;
++			cmd_bytes += 4;
++
++			packed = ((u32)cmd->font) | (((u32)cmd->options) << 16U);
++			ret = ft800_copro_write32(ft, packed);
++			if (ret < 0) return ret;
++			cmd_bytes += 4;
++
++			ret = ft800_copro_write32(ft, cmd->arg);
++			if (ret < 0) return ret;
++			cmd_bytes += 4;
++			break;
++
++		case CMD_CLOCK:
++		case CMD_SLIDER:
++		case CMD_DIAL:
++		case CMD_TOGGLE: {
++			packed = ((u32)cmd->x) | (((u32)cmd->y) << 16U);
++			ret = ft800_copro_write32(ft, packed);
++			if (ret < 0) return ret;
++			cmd_bytes += 4;
++
++			packed = ((u32)cmd->w) | (((u32)cmd->h) << 16U);
++			ret = ft800_copro_write32(ft, packed);
++			if (ret < 0) return ret;
++			cmd_bytes += 4;
++
++			packed = ((u32)cmd->options) | (((u32)cmd->val) << 16U);
++			ret = ft800_copro_write32(ft, packed);
++			if (ret < 0) return ret;
++			cmd_bytes += 4;
++
++			if (opcode == CMD_CLOCK || opcode == CMD_SLIDER) {
++				packed = (opcode == CMD_CLOCK)
++				         ? ((u32)(cmd->val << 16) | cmd->range)
++				         : (u32)(cmd->range);
++				ret = ft800_copro_write32(ft, packed);
++				if (ret < 0) return ret;
++				cmd_bytes += 4;
++			}
++
++			if (opcode == CMD_TOGGLE) {
++				len = strnlen(cmd->text, sizeof(cmd->text));
++				if (len == sizeof(cmd->text)) {
++					dev_err(dev, "CMD_TOGGLE string not null-terminated!\n");
++					return -EINVAL;
++				}
++				total = len + 1U;
++				written = 0U;
++				while (written < total) {
++					w = 0U;
++					for (idx = 0U; (idx < 4U) && ((written + idx) < total); ++idx)
++						w |= ((u32)(u8)cmd->text[written + idx]) << (8U * idx);
++					ret = ft800_copro_write32(ft, w);
++					if (ret < 0) return ret;
++					written += idx;
++					cmd_bytes += 4;
++				}
++			}
++			break;
++		}
++
++		default:
++			dev_err(dev, "serialize[%zu]: unknown or unsupported cmd=0x%08X\n", i, opcode);
++			return -EINVAL;
++		}
++
++		total_bytes += cmd_bytes;
++		dev_dbg(dev, "serialize[%zu]: wrote %zu bytes\n", i, cmd_bytes);
++	}
++
++	dev_dbg(dev, "serialize: total %zu bytes written for %zu commands\n", total_bytes, count);
++	return 0;
++}
++
++
++static int ft800_cmd_enqueue(struct ft800_dev * const      ft,
++                             const struct ft800_cmd * const cmds,
++                             const size_t                  ncmds)
++{
++	u16 read_idx;
++	u16 write_idx;
++	u16 free_bytes;
++	u32 addr_base  = FT800_RAM_CMD;
++	u32 addr       = 0U;
++	size_t i;
++	int ret;
++	const size_t word_size = sizeof(u32);
++	const u16 fifo_size = (u16)FT800_CMD_FIFO_SIZE;
++	struct device *dev = ft->dev;
++
++	if (!ft || !cmds || ncmds == 0U) {
++		dev_err(dev, "[enqueue] invalid args: ft=%p cmds=%p ncmds=%zu\n", ft, cmds, ncmds);
++		return -EINVAL;
++	}
++
++	ret = ft800_rd16(ft, FT800_REG_CMD_READ, &read_idx);
++	if (ret < 0) {
++		dev_err(dev, "[enqueue] failed to read CMD_READ\n");
++		return ret;
++	}
++
++	write_idx = ft->write_index;
++	addr      = addr_base + write_idx;
++
++	free_bytes = (u16)((read_idx - write_idx - 4U) & (fifo_size - 1U));  // 4-byte safety buffer
++
++	dev_dbg(dev, "[enqueue] start: CMD_READ=0x%04X CMD_WRITE=0x%04X free=%u bytes\n",
++	        read_idx, write_idx, free_bytes);
++
++	for (i = 0U; i < ncmds; ++i) {
++		const u32 op = cmds[i].cmd;
++
++		dev_dbg(dev, "[enqueue:%zu] cmd=0x%08X\n", i, op);
++
++		if ((op >> 24U) != 0xFFU) {
++			/* Display-list macro (DL macro – high byte not 0xFF) */
++			free_bytes = (u16)((read_idx - write_idx - 4U) & (fifo_size - 1U));
++			if (free_bytes < word_size) {
++				dev_warn(dev, "[enqueue:%zu] insufficient FIFO space for DL macro (free=%u)\n",
++				         i, free_bytes);
++				return -EAGAIN;
++			}
++
++			if ((write_idx + word_size) > fifo_size) {
++				dev_dbg(dev, "[enqueue:%zu] wrapping DL write pointer\n", i);
++				write_idx = 0U;
++				addr      = addr_base;
++			}
++
++			ret = ft800_wr32(ft, addr, op, FT800_LE);
++			if (ret < 0) {
++				dev_err(dev, "[enqueue:%zu] failed DL write @0x%06X\n", i, addr);
++				return ret;
++			}
++
++			dev_dbg(dev, "[enqueue:%zu] DL macro 0x%08X → @0x%06X\n", i, op, addr);
++			write_idx += word_size;
++			addr       = addr_base + write_idx;
++			continue;
++		}
++
++		/* Co-processor widgets */
++		switch (op) {
++		case CMD_TEXT: case CMD_BUTTON: case CMD_NUMBER:
++		case CMD_SLIDER: case CMD_CLOCK: case CMD_DIAL:
++		case CMD_KEYS:  case CMD_TOGGLE:
++			dev_dbg(dev, "[enqueue:%zu] serializing widget command: 0x%08X\n", i, op);
++			ret = ft800_serialize_cmds(ft, &cmds[i], 1U);
++			if (ret < 0) {
++				dev_err(dev, "[enqueue:%zu] serialize failed for widget 0x%08X\n", i, op);
++				return ret;
++			}
++			write_idx = ft->write_index;
++			addr      = addr_base + write_idx;
++			break;
++
++		default:
++			/* Single-word co-processor commands (e.g. CMD_SWAP, CMD_DLSTART) */
++			free_bytes = (u16)((read_idx - write_idx - 4U) & (fifo_size - 1U));
++			if (free_bytes < word_size) {
++				dev_warn(dev, "[enqueue:%zu] insufficient space for CMD 0x%08X (free=%u)\n",
++				         i, op, free_bytes);
++				return -EAGAIN;
++			}
++
++			if ((write_idx + word_size) > fifo_size) {
++				dev_dbg(dev, "[enqueue:%zu] wrapping basic command pointer\n", i);
++				write_idx = 0U;
++				addr      = addr_base;
++			}
++
++			ret = ft800_wr32(ft, addr, op, FT800_LE);
++			if (ret < 0) {
++				dev_err(dev, "[enqueue:%zu] cmd write failed @0x%06X\n", i, addr);
++				return ret;
++			}
++
++			dev_dbg(dev, "[enqueue:%zu] cmd 0x%08X → @0x%06X\n", i, op, addr);
++			write_idx += word_size;
++			addr       = addr_base + write_idx;
++			break;
++		}
++	}
++
++	/* Final update of REG_CMD_WRITE */
++	ft->write_index = write_idx;
++	ret = ft800_wr16(ft, FT800_REG_CMD_WRITE, write_idx);
++	if (ret < 0) {
++		dev_err(dev, "[enqueue] failed to write CMD_WRITE = 0x%04X\n", write_idx);
++		return ret;
++	}
++
++	dev_dbg(dev, "[enqueue] finished: CMD_WRITE=0x%04X\n", write_idx);
++	return 0;
++}
++
++/**
++ * ft800_open - open handler for misc device
++ * @inode: inode pointer
++ * @file: file pointer
++ *
++ * Implements single-open semantics with mutex protection.
++ */
++static int ft800_open(struct inode *inode, struct file *file)
++{
++    struct miscdevice *misc = file->private_data;
++    struct spi_device *spi  = container_of(misc->parent, struct spi_device, dev);
++    struct ft800_dev  *ft   = spi_get_drvdata(spi);
++
++    if (!ft)
++        return -ENODEV;
++
++    mutex_lock(&ft->lock);
++    if (ft->is_open) {
++        mutex_unlock(&ft->lock);
++        return -EBUSY;
++    }
++    ft->is_open = true;
++    mutex_unlock(&ft->lock);
++
++    file->private_data = ft;
++    return 0;
++}
++
++/**
++ * ft800_release - release handler for misc device
++ * @inode: inode pointer
++ * @file: file pointer
++ *
++ * Clears open flag with mutex protection.
++ */
++static int ft800_release(struct inode *inode, struct file *file)
++{
++    struct ft800_dev *ft = file->private_data;
++
++    mutex_lock(&ft->lock);
++    ft->is_open = false;
++    mutex_unlock(&ft->lock);
++
++    return 0;
++}
++
++/**
++ * ft800_initDL() - write a minimal display-list (colour-cleared) to the
++ *                  co-processor FIFO
++ * @ft: FT800 device context (caller must hold @ft->lock and manage PM)
++ * @r:  Red   component of the clear colour (0-255)
++ * @g:  Green component of the clear colour (0-255)
++ * @b:  Blue  component of the clear colour (0-255)
++ *
++ * The list emitted is:
++ *   CMD_DLSTART
++ *   CLEAR_COLOR_RGB(r,g,b)
++ *   CLEAR(1,1,1)          // colour + stencil + tag
++ *   DISPLAY()
++ *   CMD_SWAP
++ *
++ * Return: 0 on success or a negative errno.
++ */
++int ft800_initDL(struct ft800_dev *ft, u8 r, u8 g, u8 b)
++{
++	/* five 32-bit words */
++	u32 cmds[5] = {
++		CMD_DLSTART,
++		CLEAR_COLOR_RGB(r, g, b),
++		CLEAR(1U, 1U, 1U),
++		DISPLAY(),
++		CMD_SWAP,
++	};
++	int ret;
++
++	/* Check FIFO space for the whole list */
++	ret = ft800_wait_fifo(ft, sizeof(cmds));
++	if (ret < 0) {
++		dev_err(&ft->spi->dev,
++			"initDL: FIFO wait failed (%d)\n", ret);
++		return ret;
++	}
++
++	/* Push the list in one burst */
++	ret = ft800_cmd_enqueue_raw(ft, cmds, sizeof(cmds));
++	if (ret < 0) {
++		dev_err(&ft->spi->dev,
++			"initDL: enqueue failed (%d)\n", ret);
++		return ret;
++	}
++
++	dev_info(&ft->spi->dev,
++		 "initDL: DL queued (clear = #%02X%02X%02X)\n",
++		 r, g, b);
++
++	return 0;
++}
++
++#ifdef CONFIG_COMPAT
++/**
++ * ft800_compat_ioctl - compat ioctl for 32-bit user apps
++ * @file: file pointer
++ * @cmd: ioctl command
++ * @arg: 32-bit userspace argument
++ *
++ * Simply up-casts the 32-bit pointer and calls the native ioctl().
++ */
++static long ft800_compat_ioctl(struct file *file,
++                               unsigned int cmd,
++                               unsigned long arg)
++{
++    return ft800_ioctl(file,
++                       cmd,
++                       (unsigned long)compat_ptr(arg));
++}
++#endif
++
++
++/**
++ * ft800_ioctl() – userspace ioctl handler for FT800 device
++ */
++static long ft800_ioctl(struct file *file,
++                        unsigned int cmd,
++                        unsigned long arg)
++{
++    struct 	ft800_dev *ft;
++    long        ret = -ENOTTY;
++
++    /* 1. Validate ioctl base and number */
++    if (_IOC_TYPE(cmd) != FT800_IOCTL_BASE)
++        return -ENOTTY;
++
++    if ((_IOC_NR(cmd) < 0x01U) || (_IOC_NR(cmd) > 0x0EU))
++        return -ENOTTY;
++
++    /* 2. Validate userspace pointer access */
++    if (((_IOC_DIR(cmd) & _IOC_READ)  &&
++         !access_ok((void __user *)arg, _IOC_SIZE(cmd))) ||
++        ((_IOC_DIR(cmd) & _IOC_WRITE) &&
++         !access_ok((void __user *)arg, _IOC_SIZE(cmd))))
++        return -EFAULT;
++
++    /* 3. Retrieve device context */
++    ft = file->private_data;
++    if (ft == NULL)
++        return -ENODEV;
++
++    dev_dbg(&ft->spi->dev, "ft800_ioctl: cmd=0x%08X\n", cmd);
++
++    /* 4. Dispatch */
++    switch (cmd) {
++
++       case FT800_IOCTL_WR8: {
++		struct ft800_uapi_rw8 k;
++		if (copy_from_user(&k, (void __user *)arg, sizeof(k)))
++		    return -EFAULT;
++
++		mutex_lock(&ft->lock);
++		pm_runtime_get_sync(&ft->spi->dev);
++		ret = ft800_wr8(ft, k.addr, k.value);
++		pm_runtime_put_sync(&ft->spi->dev);
++		mutex_unlock(&ft->lock);
++		return ret;
++	}
++
++	case FT800_IOCTL_WRITE_CMDS: {
++	    struct ft800_cmd_array hdr;
++	    u32   *cmds;
++	    int    rc;
++
++	    /* Copy fixed-length header (must include 'count') */
++	    if (copy_from_user(&hdr, (void __user *)arg, sizeof(hdr)))
++		return -EFAULT;
++
++	    if (hdr.count == 0U || hdr.count > 32U)
++		return -EINVAL;
++
++	    /* Allocate enough space for all commands */
++	    cmds = kmalloc_array(hdr.count, sizeof(u32), GFP_KERNEL);
++	    if (!cmds)
++		return -ENOMEM;
++
++	    /* Copy just the command array (assumed tightly packed u32 ops) */
++	    if (copy_from_user(cmds,
++		               (void __user *)arg + sizeof(hdr),
++		               hdr.count * sizeof(u32))) {
++		kfree(cmds);
++		return -EFAULT;
++	    }
++
++	    rc = ft800_enqueue_copro_cmds(ft, cmds, hdr.count, NULL);
++	    kfree(cmds);
++	    return rc;
++	}
++
++    case FT800_IOCTL_RD8: {
++        struct ft800_uapi_rw8 k;
++        if (copy_from_user(&k, (void __user *)arg,
++                           offsetof(struct ft800_uapi_rw8, value)))
++            return -EFAULT;
++
++        mutex_lock(&ft->lock);
++        pm_runtime_get_sync(&ft->spi->dev);
++        ret = ft800_rd8(ft, k.addr, &k.value);
++        pm_runtime_put_sync(&ft->spi->dev);
++        mutex_unlock(&ft->lock);
++
++        if (ret == 0 &&
++            copy_to_user((void __user *)arg, &k, sizeof(k)))
++            return -EFAULT;
++        return ret;
++    }
++
++    case FT800_IOCTL_WR16: {
++        struct ft800_uapi_rw16 k;
++        if (copy_from_user(&k, (void __user *)arg, sizeof(k)))
++            return -EFAULT;
++
++        mutex_lock(&ft->lock);
++        pm_runtime_get_sync(&ft->spi->dev);
++        ret = ft800_wr16(ft, k.addr, k.value);
++        pm_runtime_put_sync(&ft->spi->dev);
++        mutex_unlock(&ft->lock);
++        return ret;
++    }
++
++    case FT800_IOCTL_RD16: {
++        struct ft800_uapi_rw16 k;
++        if (copy_from_user(&k, (void __user *)arg,
++                           offsetof(struct ft800_uapi_rw16, value)))
++            return -EFAULT;
++
++        mutex_lock(&ft->lock);
++        pm_runtime_get_sync(&ft->spi->dev);
++        ret = ft800_rd16(ft, k.addr, &k.value);
++        pm_runtime_put_sync(&ft->spi->dev);
++        mutex_unlock(&ft->lock);
++
++        if (ret == 0 &&
++            copy_to_user((void __user *)arg, &k, sizeof(k)))
++            return -EFAULT;
++        return ret;
++    }
++
++        /* --- get latest touch data --- */
++        case FT800_IOCTL_GET_TOUCH: {
++            struct ft800_touch touch;
++            int               rc;
++
++            mutex_lock(&ft->lock);
++            pm_runtime_get_sync(&ft->spi->dev);
++            rc = ft800_touch_read(ft);
++            pm_runtime_put_sync(&ft->spi->dev);
++            mutex_unlock(&ft->lock);
++
++            if (rc)
++                return -EIO;
++
++            touch.x   = cpu_to_le16(ft->touch_x);
++            touch.y   = cpu_to_le16(ft->touch_y);
++            touch.tag = ft->touch_tag;
++
++            if (copy_to_user((struct ft800_touch __user *)arg,
++                             &touch, sizeof(touch)))
++                return -EFAULT;
++            return 0;
++        }
++
++	/* --- submit structured co-processor command descriptors ------------- */
++	case FT800_IOCTL_SUBMIT_CMDS: {
++	    struct ft800_uapi_exec_cmds ureq;
++	    struct ft800_cmd *kcmds = NULL;
++	    size_t nbytes;
++	    int ret = 0;
++
++	    /* Step 1: Copy ioctl payload from userspace */
++	    if (copy_from_user(&ureq, (void __user *)arg, sizeof(ureq)))
++	        return -EFAULT;
++
++	    if (!ureq.user_ptr || ureq.count == 0 || ureq.count > 256)
++	        return -EINVAL;
++
++	    nbytes = ureq.count * sizeof(struct ft800_cmd);
++
++	    /* Step 2: Copy command descriptors from userspace */
++	    kcmds = memdup_user((void __user *)(uintptr_t)ureq.user_ptr, nbytes);
++
++	    if (IS_ERR(kcmds))
++	        return PTR_ERR(kcmds);
++
++	   dev_info(&ft->spi->dev, "[ioctl] SUBMIT_CMDS: count=%u user_ptr=0x%08X\n", ureq.count, ureq.user_ptr);
++
++	    /* Step 3: Lock and power-up */
++	    mutex_lock(&ft->lock);
++	    ret = pm_runtime_get_sync(&ft->spi->dev);
++	    if (ret < 0) {
++	        dev_err(&ft->spi->dev, "[ft800] PM runtime sync failed: %d\n", ret);
++	        pm_runtime_put_noidle(&ft->spi->dev);
++	        mutex_unlock(&ft->lock);
++	        kfree(kcmds);
++	        return ret;
++	    }
++
++	    /* Step 4: Enqueue via kernel-side command logic */
++	    ret = ft800_cmd_enqueue(ft, kcmds, ureq.count);
++	    if (ret < 0) {
++	        dev_warn(&ft->spi->dev, "[ft800] ft800_cmd_enqueue failed: %d\n", ret);
++	    }
++
++	    /* Step 5: Power down and unlock */
++	    pm_runtime_put_sync(&ft->spi->dev);
++	    mutex_unlock(&ft->lock);
++	    kfree(kcmds);
++	    return ret;
++	}
++
++	/* --- clear display list --- */
++	case FT800_IOCTL_CLEAR_DL: {
++		int rc;
++		u16 hw_write;
++
++		if (arg != 0UL)
++			return -EINVAL;
++
++		mutex_lock(&ft->lock);
++		pm_runtime_get_sync(&ft->spi->dev);
++
++		dev_info(ft->dev, "CLEAR_DL: resetting co-processor state\n");
++
++		/* Reset command write pointer and DL */
++		rc = ft800_wr16(ft, FT800_REG_CMD_WRITE, 0U);
++		if (rc < 0) {
++			dev_err(ft->dev, "CLEAR_DL: failed to write CMD_WRITE=0\n");
++			goto out_unlock;
++		}
++
++		rc = ft800_wr16(ft, FT800_REG_CMD_DL, 0U);
++		if (rc < 0) {
++			dev_err(ft->dev, "CLEAR_DL: failed to write CMD_DL=0\n");
++			goto out_unlock;
++		}
++
++		/* Sync software write_index to hardware */
++		rc = ft800_rd16(ft, FT800_REG_CMD_WRITE, &hw_write);
++		if (rc < 0) {
++			dev_err(ft->dev, "CLEAR_DL: failed to read CMD_WRITE\n");
++			goto out_unlock;
++		}
++		ft->write_index = hw_write;
++
++		dev_dbg(ft->dev, "CLEAR_DL: write_index re-synced to 0x%04X\n", hw_write);
++
++	out_unlock:
++		pm_runtime_put_sync(&ft->spi->dev);
++		mutex_unlock(&ft->lock);
++		return rc;
++	}
++
++	case FT800_IOCTL_RESET: {
++		struct ft800_uapi_reset rst;
++		u8   id;
++		u16  hw_write = 0;
++		int  rc;
++
++		if (copy_from_user(&rst, (void __user *)arg, sizeof(rst)) != 0)
++			return dev_err_probe(&ft->spi->dev, -EFAULT,
++				             "[RESET] copy_from_user failed\n");
++
++		if ((rst.clear_display > 1U) ||
++		    (rst.r > 0xFFU) || (rst.g > 0xFFU) || (rst.b > 0xFFU)) {
++			return dev_err_probe(&ft->spi->dev, -EINVAL,
++				"[RESET] invalid args: clear=%u r=%u g=%u b=%u\n",
++				rst.clear_display, rst.r, rst.g, rst.b);
++		}
++
++		mutex_lock(&ft->lock);
++
++		rc = pm_runtime_get_sync(&ft->spi->dev);
++		if (rc < 0) {
++			mutex_unlock(&ft->lock);
++			return dev_err_probe(&ft->spi->dev, rc,
++				             "[RESET] pm_runtime_get_sync failed\n");
++		}
++
++		dev_info(&ft->spi->dev, "[RESET] hardware boot sequence...");
++		rc = ft800_hw_boot(ft);
++		if (rc != 0)
++			goto out;
++
++		rc = ft800_read_id(ft, &id);
++		if (rc != 0 || id != 0x7C) {
++			dev_err(&ft->spi->dev, "[RESET] unexpected chip ID 0x%02X (expected 0x7C)\n", id);
++			if (rc == 0) rc = -ENODEV;
++			goto out;
++		}
++
++		dev_dbg(&ft->spi->dev, "[RESET] chip ID 0x%02X confirmed\n", id);
++
++		if (rst.clear_display != 0U) {
++			dev_dbg(&ft->spi->dev, "[RESET] issuing default DL clear to RGB(%u,%u,%u)...",
++				rst.r, rst.g, rst.b);
++			rc = ft800_initDL(ft, rst.r, rst.g, rst.b);
++			if (rc != 0)
++				goto out;
++		}
++
++		dev_info(&ft->spi->dev, "[RESET] enabling PCLK = %u", ft800_pclk_div);
++		rc = ft800_wr8(ft, FT800_REG_PCLK, ft800_pclk_div);
++		if (rc != 0)
++			goto out;
++
++		dev_info(&ft->spi->dev, "[RESET] initializing touch, PWM, and GPIOs");
++
++		rc = ft800_touch_init(ft);
++		if (rc != 0)
++			goto out;
++
++		rc = ft800_pwm_init(ft);
++		if (rc != 0)
++			goto out;
++
++		rc = ft800_set_gpio_outputs(ft);
++		if (rc != 0)
++			goto out;
++
++		/* Sync software FIFO state */
++		rc = ft800_rd16(ft, FT800_REG_CMD_WRITE, &hw_write);
++		if (rc < 0) {
++			dev_err(&ft->spi->dev, "[RESET] failed to read CMD_WRITE\n");
++			goto out;
++		}
++		ft->write_index = hw_write;
++		dev_dbg(&ft->spi->dev, "[RESET] write_index synced to 0x%04X\n", hw_write);
++
++		rc = 0;  /* success */
++
++	out:
++		pm_runtime_put_sync(&ft->spi->dev);
++		mutex_unlock(&ft->lock);
++
++		dev_info(&ft->spi->dev, "[RESET] complete (%d)\n", rc);
++		return rc;
++	}
++
++        /* --- read engine status --- */
++        case FT800_IOCTL_GET_STATUS: {
++            struct ft800_status st;
++            uint8_t             tmp8;
++            int                 rc;
++
++            dev_dbg(&ft->spi->dev, "[GET_STATUS] Entry");
++
++            /* grab lock only for SPI I/O */
++            mutex_lock(&ft->lock);
++            pm_runtime_get_sync(&ft->spi->dev);
++
++            rc  = ft800_rd16(ft, FT800_REG_CMD_READ,  &st.cmd_read);
++            rc |= ft800_rd16(ft, FT800_REG_CMD_WRITE, &st.cmd_write);
++            rc |= ft800_rd8 (ft, FT800_REG_ID,        &tmp8);
++
++            pm_runtime_put_sync(&ft->spi->dev);
++            mutex_unlock(&ft->lock);
++
++            if (rc) {
++                dev_err(&ft->spi->dev,
++                        "[GET_STATUS] SPI read failed: %d", rc);
++                return -EIO;
++            }
++
++            /* fill out the UAPI struct */
++            st.id        = tmp8;
++            st.cmd_read  = cpu_to_le16(st.cmd_read);
++            st.cmd_write = cpu_to_le16(st.cmd_write);
++
++            if (copy_to_user((struct ft800_status __user *)arg,
++                             &st, sizeof(st))) {
++                dev_err(&ft->spi->dev,
++                        "[GET_STATUS] copy_to_user failed");
++                return -EFAULT;
++            }
++
++            dev_dbg(&ft->spi->dev,
++                    "[GET_STATUS] Exit OK: id=0x%02x read=0x%03x write=0x%03x",
++                    st.id,
++                    le16_to_cpu(st.cmd_read),
++                    le16_to_cpu(st.cmd_write));
++            return 0;
++        }
++
++        /* --- arbitrary memory read --- */
++	case FT800_IOCTL_MEMREAD: /* arbitrary FT800 → userspace */
++	{
++	    struct ft800_mem_op kop;
++	    unsigned char      *udata;
++	    int                 rc;
++
++	    /* pull in addr+len */
++	    if ( copy_from_user(&kop,
++		                (void __user *)arg,
++		                offsetof(struct ft800_mem_op, data)) )
++		return -EFAULT;
++
++	    if (!IS_ALIGNED(kop.addr,4U) ||
++		kop.len == 0 ||
++		kop.len > sizeof(kop.data) ||
++		kop.addr + kop.len > FT800_MAX_MEM)
++		return -EINVAL;
++
++	    udata = (unsigned char __user *)arg
++		  + offsetof(struct ft800_mem_op, data);
++	    if (!access_ok(udata, kop.len))
++		return -EFAULT;
++
++	    mutex_lock(&ft->lock);
++	    pm_runtime_get_sync(&ft->spi->dev);
++
++	    rc = ft800_read_mem(ft, kop.addr, kop.data, kop.len);
++
++	    pm_runtime_put_sync(&ft->spi->dev);
++	    mutex_unlock(&ft->lock);
++
++	    if (rc < 0)
++		return rc;
++
++	    /* copy it back */
++	    if ( copy_to_user(udata, kop.data, kop.len) )
++		return -EFAULT;
++
++	    return rc;
++	}
++
++        /* --- arbitrary memory write ----------------------------------------- */
++	case FT800_IOCTL_MEMWRITE:      /* userspace → arbitrary FT800 address */
++	{
++	    struct ft800_mem_op kop;
++	    unsigned char      *udata;
++	    int                 rc, err;
++
++	    dev_dbg(&ft->spi->dev, "[MEMWRITE] Entry");
++
++	    /* 1) copy only addr + len (not the full data blob) */
++	    if (copy_from_user(&kop,
++		               (void __user *)arg,
++		               offsetof(struct ft800_mem_op, data))) {
++		dev_err(&ft->spi->dev, "[MEMWRITE] copy_from_user(header) failed");
++		return -EFAULT;
++	    }
++	    dev_dbg(&ft->spi->dev,
++		    "[MEMWRITE] header: addr=0x%08x len=%u",
++		    kop.addr, kop.len);
++
++	    /* 2) validate alignment, bounds and size */
++	    if (!IS_ALIGNED(kop.addr, 4U) ||
++		kop.len == 0 ||
++		kop.len > sizeof(kop.data) ||
++		kop.addr + kop.len > FT800_MAX_MEM) {
++		dev_err(&ft->spi->dev,
++		        "[MEMWRITE] invalid parameters: addr=0x%08x len=%u",
++		        kop.addr, kop.len);
++		return -EINVAL;
++	    }
++
++	    /* 3) verify userspace can supply kop.len bytes */
++	    udata = (unsigned char __user *)arg
++		    + offsetof(struct ft800_mem_op, data);
++	    if (!access_ok(udata, kop.len)) {
++		dev_err(&ft->spi->dev,
++		        "[MEMWRITE] access_ok(data) failed");
++		return -EFAULT;
++	    }
++
++	    /* 4) pull in the payload */
++	    if (copy_from_user(kop.data, udata, kop.len)) {
++		dev_err(&ft->spi->dev,
++		        "[MEMWRITE] copy_from_user(data) failed");
++		return -EFAULT;
++	    }
++
++	    /* 5) perform chunked writes under lock + runtime-PM (Option B) */
++	    {
++		u32   addr   = kop.addr;
++		u32   remain = kop.len;
++		u8   *p      = kop.data;
++
++		rc = 0;
++		mutex_lock(&ft->lock);
++		pm_runtime_get_sync(&ft->spi->dev);
++
++		while (remain) {
++		    u32 chunk;
++
++		    /* pick largest power-of-two ≤ remain and matching alignment */
++		    if (remain >= 8 && IS_ALIGNED(addr, 8U))
++		        chunk = 8;
++		    else if (remain >= 4 && IS_ALIGNED(addr, 4U))
++		        chunk = 4;
++		    else if (remain >= 2 && IS_ALIGNED(addr, 2U))
++		        chunk = 2;
++		    else
++		        chunk = 1;
++
++		    err = ft800_write_mem(ft, addr, p, chunk);
++		    if (err < 0) {
++		        rc = err;
++		        break;
++		    }
++
++		    addr   += chunk;
++		    p      += chunk;
++		    remain -= chunk;
++		    rc     += err;
++		}
++
++		pm_runtime_put_sync(&ft->spi->dev);
++		mutex_unlock(&ft->lock);
++	    }
++
++	    /* 6) log outcome */
++	    if (rc < 0)
++		dev_err(&ft->spi->dev,
++		        "[MEMWRITE] ft800_write_mem failed: %d", rc);
++	    else
++		dev_dbg(&ft->spi->dev,
++		        "[MEMWRITE] Exit OK: wrote %u bytes to 0x%08x",
++		        kop.len, kop.addr);
++
++	    return rc;
++	}
++
++        default:
++            return ret;
++    }
++}
++
++static const struct file_operations ft800_fops = {
++    .owner          = THIS_MODULE,
++    .open           = ft800_open,
++    .release        = ft800_release,
++    .llseek         = ft800_llseek,
++    .read           = ft800_read,
++    .write          = ft800_write,
++    .unlocked_ioctl = ft800_ioctl,
++#ifdef CONFIG_COMPAT
++    .compat_ioctl   = ft800_compat_ioctl,
++#endif
++};
++
++
++
++/**
++ * ft800_probe() - Probe and initialize the FT800/FT843 SPI device (PIO-only)
++ * @spi: pointer to SPI device
++ *
++ * Handles hardware reset, clock mode, display register init, and increases SPI speed after
++ * 48 MHz clock selection. Also blanks the screen before configuration, as recommended by FTDI.
++ *
++ * Return: 0 on success, or a negative errno on failure.
++ */
++
++static int ft800_probe(struct spi_device *spi)
++{
++	struct ft800_dev *ft;
++	u16 timings[ARRAY_SIZE(fallback)];
++	u8  id;
++	int ret;
++
++	dev_info(&spi->dev, "FT800: entering probe()\n");
++
++	/* -------------------------------------------------------- alloc / book-keeping */
++	dev_info(&spi->dev, "FT800: allocating device context\n");
++	ft = devm_kzalloc(&spi->dev, sizeof(*ft), GFP_KERNEL);
++
++	if (!ft)
++		return dev_err_probe(&spi->dev, -ENOMEM, "alloc failed\n");
++
++	mutex_init(&ft->lock);
++
++	ft->spi         = spi;
++	ft->dev = &spi->dev;         /* ✅ Needed for dev_dbg/dev_err */
++	ft->reg_dlswap  = FT800_REG_DLSWAP;
++	ft->write_index = 0;
++	ft->is_open     = false;
++	spi_set_drvdata(spi, ft);
++
++	/* -------------------------------------------------------- low-speed SPI first */
++	dev_info(&spi->dev, "FT800: setting initial SPI speed ≤ 11 MHz\n");
++	ret = ft800_spi_set_speed(spi, 11 * 1000 * 1000); /* ≤ 11 MHz before 48 MHz */
++	if (ret)
++		return dev_err_probe(&spi->dev, ret, "spi low-speed failed\n");
++
++	pm_runtime_enable(&spi->dev);
++
++	/* -------------------------------------------------------- HW boot sequence */
++	dev_info(&spi->dev, "FT800: beginning hardware boot sequence\n");
++	mutex_lock(&ft->lock);
++	pm_runtime_get_sync(&spi->dev);
++	ret = ft800_hw_boot(ft);		/* CORERST → ACTIVE → CLK48M → PCLK=0 */
++	pm_runtime_put_sync(&spi->dev);
++	mutex_unlock(&ft->lock);
++	if (ret) {
++		dev_err(&spi->dev, "FT800: hardware boot failed (%d)\n", ret);
++		goto err_pm_disable;
++	}
++
++	/* -------------------------------------------------------- read & verify chip */
++	dev_info(&spi->dev, "FT800: reading device ID\n");
++	mutex_lock(&ft->lock);
++	pm_runtime_get_sync(&spi->dev);
++	ret = ft800_read_id(ft, &id);
++	pm_runtime_put_sync(&spi->dev);
++	mutex_unlock(&ft->lock);
++	if (ret) {
++		dev_err(&spi->dev, "FT800: failed to read ID (%d)\n", ret);
++		goto err_pm_disable;
++	}
++	dev_info(&spi->dev, "FT800: read ID = 0x%02x\n", id);
++	if (id != 0x7c) {
++		dev_err(&spi->dev, "FT800: unexpected ID value (expected 0x7c)\n");
++		ret = -ENODEV;
++		goto err_pm_disable;
++	}
++
++	/* -------------------------------------------------------- timing table */
++	dev_info(&spi->dev, "FT800: parsing display timings from DT\n");
++	if (ft800_parse_dt_timings(&spi->dev, timings)) {
++		dev_warn(&spi->dev, "FT800: falling back to default timings\n");
++		memcpy(timings, fallback, sizeof(timings));
++	}
++
++	/* -------------------------------------------------------- write timings */
++	dev_info(&spi->dev, "FT800: writing display timings\n");
++	mutex_lock(&ft->lock);
++	pm_runtime_get_sync(&spi->dev);
++	ret = ft800_write_timings(ft, timings);
++	pm_runtime_put_sync(&spi->dev);
++	mutex_unlock(&ft->lock);
++	if (ret) {
++		dev_err(&spi->dev, "FT800: failed to write timings (%d)\n", ret);
++		goto err_pm_disable;
++	}
++
++	/* -------------------------------------------------------- minimal DL (white) */
++	dev_info(&spi->dev, "FT800: writing initial display list (white)\n");
++	mutex_lock(&ft->lock);
++	pm_runtime_get_sync(&spi->dev);
++	ret = ft800_initDL(ft, 0xff, 0xff, 0xff); /* blank – white */
++	pm_runtime_put_sync(&spi->dev);
++	mutex_unlock(&ft->lock);
++	if (ret) {
++		dev_err(&spi->dev, "FT800: failed to initDL (%d)\n", ret);
++		goto err_pm_disable;
++	}
++
++	/* -------------------------------------------------------- enable PCLK */
++	dev_info(&spi->dev, "FT800: enabling PCLK\n");
++	mutex_lock(&ft->lock);
++	pm_runtime_get_sync(&spi->dev);
++
++        ft800_pclk_div = (u8)timings[13];  /* save display PCLK divider */
++
++	ret = ft800_wr8(ft, FT800_REG_PCLK, ft800_pclk_div);
++	pm_runtime_put_sync(&spi->dev);
++	mutex_unlock(&ft->lock);
++	if (ret) {
++		dev_err(&spi->dev, "FT800: failed to enable PCLK (%d)\n", ret);
++		goto err_pm_disable;
++	}
++
++	/* -------------------------------------------------------- touch, PWM, GPIO */
++	dev_info(&spi->dev, "FT800: initializing touch, PWM, and GPIO outputs\n");
++	ret = ft800_touch_init(ft);
++	if (ret) {
++		dev_err(&spi->dev, "FT800: touch init failed (%d)\n", ret);
++		goto err_pm_disable;
++	}
++	ret = ft800_pwm_init(ft);
++	if (ret) {
++		dev_err(&spi->dev, "FT800: PWM init failed (%d)\n", ret);
++		goto err_pm_disable;
++	}
++	ret = ft800_set_gpio_outputs(ft);
++	if (ret) {
++		dev_err(&spi->dev, "FT800: GPIO init failed (%d)\n", ret);
++		goto err_pm_disable;
++	}
++
++	/* -------------------------------------------------------- bump SPI to 30 MHz */
++	dev_info(&spi->dev, "FT800: increasing SPI speed to 30 MHz\n");
++	ret = ft800_spi_set_speed(spi, 30 * 1000 * 1000);
++	if (ret) {
++		dev_err(&spi->dev, "FT800: failed to increase SPI speed (%d)\n", ret);
++		goto err_pm_disable;
++	}
++
++	/* -------------------------------------------------------- misc-device node */
++	dev_info(&spi->dev, "FT800: registering /dev/ft800 misc device\n");
++	ft->misc.minor  = MISC_DYNAMIC_MINOR;
++	ft->misc.name   = "ft800";
++	ft->misc.fops   = &ft800_fops;
++	ft->misc.parent = &spi->dev;
++	ret = misc_register(&ft->misc);
++	if (ret) {
++		dev_err(&spi->dev, "FT800: failed to register misc device (%d)\n", ret);
++		goto err_pm_disable;
++	}
++
++	dev_info(&spi->dev,
++		 "FT800 ready – /dev/%s, PCLK=%lu Hz, SPI=30 MHz\n",
++		 ft->misc.name, 48UL * 1000 * 1000 / ft800_pclk_div);
++	return 0;
++
++err_pm_disable:
++	dev_err(&spi->dev, "FT800: probe failed, cleaning up\n");
++	pm_runtime_disable(&spi->dev);
++	return dev_err_probe(&spi->dev, ret, "probe failed\n");
++}
++
++static void ft800_remove(struct spi_device *spi)
++{
++    struct ft800_dev *ft = spi_get_drvdata(spi);
++
++    misc_deregister(&ft->misc);
++    pm_runtime_disable(&spi->dev);
++}
++
++/* ---- Power Management (skeleton) ---- */
++static const struct dev_pm_ops ft800_pm_ops = {};
++
++/* ---- Device tree ---- */
++static const struct of_device_id ft800_of_match[] = {
++    { .compatible = "bridgetek,ft800" }, {}
++};
++MODULE_DEVICE_TABLE(of, ft800_of_match);
++
++/* ---- SPI driver ---- */
++static struct spi_driver ft800_driver = {
++    .driver = {
++        .name           = "ft800",
++        .of_match_table = ft800_of_match,
++        .pm             = &ft800_pm_ops,
++    },
++    .probe  = ft800_probe,
++    .remove = (void *)ft800_remove,
++};
++module_spi_driver(ft800_driver);
++
++MODULE_LICENSE("GPL-2.0");
++MODULE_DESCRIPTION("Bridgetek FT800 SPI driver");
++MODULE_AUTHOR("Dr. Richard Day");
++MODULE_VERSION("1.0");
+diff --git a/drivers/ft800-driver/ft800.h b/drivers/ft800-driver/ft800.h
+new file mode 100644
+index 000000000000..df678c11433a
+--- /dev/null
++++ b/drivers/ft800-driver/ft800.h
+@@ -0,0 +1,282 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * ft800.h – Bridgetek FT800 (EVE1) kernel‑driver definitions
++ *
++ * All addresses & opcodes taken verbatim from “FT800 Series Programmer’s
++ * Guide”, v2.1 (BRT_000030, Jul‑2022).  This header now contains **every**
++ * macro, enum, struct or constant referenced by ft800.c (Yocto Scarthgap
++ * AM335x target) so it builds warning‑free under GCC‑arm.
++ *
++ * MISRA‑light: 4‑space indents, tabs = 8, one short comment per block.
++ */
++
++#ifndef _FT800_H_
++#define _FT800_H_
++
++#include <linux/types.h>
++#include <linux/spi/spi.h>
++#include <linux/miscdevice.h>
++#include <linux/gpio/consumer.h>
++#include <linux/regulator/consumer.h>
++#include <linux/mutex.h>
++#include <linux/completion.h>
++#include <linux/workqueue.h>
++#include "ft800_uapi.h"
++
++#define FT800_MAX_CMD_TEXT_LEN       63U
++#define FT800_TIMING_REG_COUNT       14U
++
++#define FT800_SHIFT_LSB              0U
++#define FT800_SHIFT_MSB              8U
++#define FT800_SHIFT_BYTE0            0U
++#define FT800_SHIFT_BYTE1            8U
++#define FT800_SHIFT_BYTE2            16U
++#define FT800_SHIFT_BYTE3            24U
++
++#define FT800_ADDR_MASK              0x00FFFFFFu
++
++#define FT800_LE                     0x00u
++#define FT800_BE                     0x01u
++
++#define FT800_RAM_G_START        0x000000UL
++#define FT800_RAM_G_SIZE         (256UL * 1024UL)
++
++#define FT800_ROM_FONT           0x0B0000UL
++#define FT800_ROM_CHIPID         0x0C0000UL
++#define FT800_ROM_FONT_ADDR      0x0FFFFCUL
++
++#define FT800_RAM_DL_START       0x100000UL
++#define FT800_RAM_DL_SIZE        (8UL  * 1024UL)
++
++#define FT800_RAM_PAL_START      0x102000UL
++#define FT800_PAL_SIZE           (1UL  * 1024UL)
++
++#define FT800_REG_START          0x102400UL
++#define FT800_REG_SIZE           0x0380UL
++
++#define FT800_RAM_CMD_START      0x108000UL
++#define FT800_RAM_CMD_SIZE       (4UL  * 1024UL)
++
++#define FT800_RAM_SNAPSHOT_START 0x1C2000UL
++#define FT800_RAM_SNAPSHOT_SIZE  (2UL  * 1024UL)
++
++#define FT800_MAX_MEM (FT800_RAM_CMD_START + FT800_RAM_CMD_SIZE)
++
++#define FT800_RAM_G              FT800_RAM_G_START
++#define FT800_RAM_DL             FT800_RAM_DL_START
++#define FT800_RAM_CMD            FT800_RAM_CMD_START
++#define FT800_RAM_REG            FT800_REG_START
++#define FT800_CMD_FIFO_SIZE      FT800_RAM_CMD_SIZE
++
++#define FT800_IS_RAM_G(a,l)   (((a) >= FT800_RAM_G_START)   && (((a)+(l)) <= (FT800_RAM_G_START   + FT800_RAM_G_SIZE)))
++#define FT800_IS_RAM_DL(a,l)  (((a) >= FT800_RAM_DL_START)  && (((a)+(l)) <= (FT800_RAM_DL_START  + FT800_RAM_DL_SIZE)))
++#define FT800_IS_REG(a,l)     (((a) >= FT800_REG_START)     && (((a)+(l)) <= (FT800_REG_START     + FT800_REG_SIZE)))
++#define FT800_IS_RAM_CMD(a,l) (((a) >= FT800_RAM_CMD_START) && (((a)+(l)) <= (FT800_RAM_CMD_START+ FT800_RAM_CMD_SIZE)))
++
++enum ft800_mem_region {
++    FT800_REGION_INVALID = 0,
++    FT800_REGION_RAM_G,
++    FT800_REGION_RAM_DL,
++    FT800_REGION_REG,
++    FT800_REGION_RAM_CMD,
++    FT800_REGION_OTHER,
++};
++#define FT800_REGION_DL FT800_REGION_RAM_DL
++
++#define FT800_SPI_WR             0x80u
++#define FT800_SPI_RD             0x00u
++
++#define FT800_REG_ID                 0x102400UL
++#define FT800_REG_HCYCLE             0x102428UL
++#define FT800_REG_HOFFSET            0x10242CUL
++#define FT800_REG_HSIZE              0x102430UL
++#define FT800_REG_HSYNC0             0x102434UL
++#define FT800_REG_HSYNC1             0x102438UL
++#define FT800_REG_VCYCLE             0x10243CUL
++#define FT800_REG_VOFFSET            0x102440UL
++#define FT800_REG_VSIZE              0x102444UL
++#define FT800_REG_VSYNC0             0x102448UL
++#define FT800_REG_VSYNC1             0x10244CUL
++#define FT800_REG_DLSWAP             0x102450UL
++#define FT800_REG_SWIZZLE            0x102460UL
++#define FT800_REG_CSPREAD            0x102464UL
++#define FT800_REG_PCLK_POL           0x102468UL
++#define FT800_REG_PCLK               0x10246CUL
++#define FT800_REG_GPIO_DIR           0x10248CUL
++#define FT800_REG_GPIO               0x102490UL
++#define FT800_REG_PWM_HZ             0x1024C0UL
++#define FT800_REG_PWM_DUTY           0x1024C4UL
++#define FT800_REG_CMD_READ           0x1024E4UL
++#define FT800_REG_CMD_WRITE          0x1024E8UL
++#define FT800_REG_CMD_DL             0x1024ECUL
++#define FT800_REG_TOUCH_MODE         0x1024F0UL
++#define FT800_REG_TOUCH_RZTHRESH     0x102504UL
++#define FT800_REG_TOUCH_SCREEN_XY    0x102510UL
++#define FT800_REG_TOUCH_RZ           0x10250CUL
++#define FT800_REG_TOUCH_TAG          0x102518UL
++
++#define DLSWAP_FRAME                 0x02u
++
++#define FT800_DL_OP_DISPLAY          0x00U
++#define FT800_DL_OP_BITMAP_SOURCE    0x01U
++#define FT800_DL_OP_CLEAR_COLOR_RGB  0x02U
++#define FT800_DL_OP_TAG              0x03U
++#define FT800_DL_OP_COLOR_RGB        0x04U
++#define FT800_DL_OP_BITMAP_HANDLE    0x05U
++#define FT800_DL_OP_CELL             0x06U
++#define FT800_DL_OP_BITMAP_LAYOUT    0x07U
++#define FT800_DL_OP_BITMAP_SIZE      0x08U
++#define FT800_DL_OP_ALPHA_FUNC       0x09U
++#define FT800_DL_OP_STENCIL_FUNC     0x0AU
++#define FT800_DL_OP_BLEND_FUNC       0x0BU
++#define FT800_DL_OP_STENCIL_OP       0x0CU
++#define FT800_DL_OP_POINT_SIZE       0x0DU
++#define FT800_DL_OP_LINE_WIDTH       0x0EU
++#define FT800_DL_OP_CLEAR_COLOR_A    0x0FU
++#define FT800_DL_OP_COLOR_A          0x10U
++#define FT800_DL_OP_CLEAR_STENCIL    0x11U
++#define FT800_DL_OP_CLEAR_TAG        0x12U
++#define FT800_DL_OP_STENCIL_MASK     0x13U
++#define FT800_DL_OP_TAG_MASK         0x14U
++#define FT800_DL_OP_BITMAP_TRANSFORM_A 0x15U
++#define FT800_DL_OP_BITMAP_TRANSFORM_B 0x16U
++#define FT800_DL_OP_BITMAP_TRANSFORM_C 0x17U
++#define FT800_DL_OP_BITMAP_TRANSFORM_D 0x18U
++#define FT800_DL_OP_BITMAP_TRANSFORM_E 0x19U
++#define FT800_DL_OP_BITMAP_TRANSFORM_F 0x1AU
++#define FT800_DL_OP_SCISSOR_XY       0x1BU
++#define FT800_DL_OP_SCISSOR_SIZE     0x1CU
++#define FT800_DL_OP_CALL             0x1DU
++#define FT800_DL_OP_JUMP             0x1EU
++#define FT800_DL_OP_BEGIN            0x1FU
++#define FT800_DL_OP_COLOR_MASK       0x20U
++#define FT800_DL_OP_END              0x21U
++#define FT800_DL_OP_SAVE_CONTEXT     0x22U
++#define FT800_DL_OP_RESTORE_CONTEXT  0x23U
++#define FT800_DL_OP_RETURN           0x24U
++#define FT800_DL_OP_MACRO            0x25U
++#define FT800_DL_OP_CLEAR            0x26U
++#define FT800_DL_OP_VERTEX2F         0x40U  /* ms‑bits 01 */
++#define FT800_DL_OP_VERTEX2II        0x80U  /* ms‑bits 10 */
++
++#define CLEAR_COLOR_RGB(r,g,b) (((FT800_DL_OP_CLEAR_COLOR_RGB) << 24) | (((r)&0xFFU)<<16) | (((g)&0xFFU)<<8) | ((b)&0xFFU))
++#define CLEAR_COLOR_A(a)       (((FT800_DL_OP_CLEAR_COLOR_A)   << 24) | ((a) & 0xFFU))
++#define CLEAR(c,s,t)           (((FT800_DL_OP_CLEAR)           << 24) | (((c)&1U)<<2) | (((s)&1U)<<1) | ((t)&1U))
++#define DISPLAY()              0x00000000UL
++#define BEGIN(prim)            (((FT800_DL_OP_BEGIN)           << 24) | ((prim) & 0xFFU))
++#define END()                  ((FT800_DL_OP_END) << 24)
++#define COLOR_RGB(r,g,b)       (((FT800_DL_OP_COLOR_RGB)       << 24) | (((r)&0xFFU)<<16) | (((g)&0xFFU)<<8) | ((b)&0xFFU))
++#define COLOR_A(a)             (((FT800_DL_OP_COLOR_A)         << 24) | ((a) & 0xFFU))
++#define TAG(s)                 (((FT800_DL_OP_TAG)             << 24) | ((s) & 0xFFU))
++#define TAG_MASK(m)            (((FT800_DL_OP_TAG_MASK)        << 24) | ((m) & 0x01U))
++#define VERTEX2F(x,y)          (((FT800_DL_OP_VERTEX2F)        << 24) | ((((x)&0x3FFFU)<<14) | (((y)&0x3FFFU)<<2)))
++#define VERTEX2II(x,y,h,c)     (((FT800_DL_OP_VERTEX2II)       << 24) | ((((h)&0x1FU)<<19) | (((c)&0x7FU)<<12) | (((x)&0x1FFU)<<9) | ((y)&0x1FFU)))
++#define BITMAP_SOURCE(a)       (((FT800_DL_OP_BITMAP_SOURCE)   << 24) | ((a) & 0x1FFFFFUL))
++#define BITMAP_LAYOUT(f,s,h)   (((FT800_DL_OP_BITMAP_LAYOUT)   << 24) | (((f)&0x1FU)<<19) | (((s)&0x1FFFUL)<<6) | ((h)&0x3FU))
++#define BITMAP_SIZE(fl,wx,wy,w,h) (((FT800_DL_OP_BITMAP_SIZE)  << 24) | (((fl)&3U)<<20) | (((wx)&1U)<<19) | (((wy)&1U)<<18) | (((w)&0x1FFU)<<9) | ((h)&0x1FFU))
++
++#define CMD_DLSTART      0xFFFFFF00UL
++#define CMD_SWAP         0xFFFFFF01UL
++#define CMD_INTERRUPT    0xFFFFFF02UL
++#define CMD_APPEND       0xFFFFFF1EUL
++#define CMD_BGCOLOR      0xFFFFFF09UL
++#define CMD_BUTTON       0xFFFFFF0DUL
++#define CMD_CLOCK        0xFFFFFF12UL
++#define CMD_COLDSTART    0xFFFFFF32UL
++#define CMD_DIAL         0xFFFFFF13UL
++#define CMD_FGCOLOR      0xFFFFFF0AUL
++#define CMD_GRADIENT     0xFFFFFF0BUL
++#define CMD_GRADCOLOR    0xFFFFFF34UL
++#define CMD_INFLATE      0xFFFFFF22UL
++#define CMD_KEYS         0xFFFFFF0EUL
++#define CMD_LOADIDENTITY 0xFFFFFF26UL
++#define CMD_LOGO         0xFFFFFF31UL
++#define CMD_MEMCPY       0xFFFFFF1DUL
++#define CMD_MEMSET       0xFFFFFF1BUL
++#define CMD_MEMWRITE     0xFFFFFF1AUL
++#define CMD_MEMCRC       0xFFFFFF18UL
++#define CMD_NUMBER       0xFFFFFF2AUL
++#define CMD_PROGRESS     0xFFFFFF0FUL
++#define CMD_REGREAD      0xFFFFFF19UL
++#define CMD_ROMFONT      0xFFFFFF3FUL
++#define CMD_ROTATE       0xFFFFFF29UL
++#define CMD_SCALE        0xFFFFFF28UL
++#define CMD_SCROLLBAR    0xFFFFFF11UL
++#define CMD_SETFONT      0xFFFFFF2EUL
++#define CMD_SETSCRATCH   0xFFFFFF3CUL
++#define CMD_SKETCH       0xFFFFFF30UL
++#define CMD_SLIDER       0xFFFFFF10UL
++#define CMD_SPINNER      0xFFFFFF16UL
++#define CMD_STOP         0xFFFFFF17UL
++#define CMD_TOGGLE       0xFFFFFF11UL
++#define CMD_TRACK        0xFFFFFF2CUL
++#define CMD_TRANSLATE    0xFFFFFF27UL
++#define CMD_TEXT         0xFFFFFF0CUL
++#define CMD_BITMAP_TRANSFORM 0xFFFFFF21UL  // undocumented in some places
++#define CMD_BITMAP_HANDLE    0xFFFFFF1FUL
++#define CMD_BITMAP_LAYOUT    0xFFFFFF07UL
++#define CMD_BITMAP_SIZE      0xFFFFFF08UL
++
++
++
++#define FT800_CMD_TEXT         CMD_TEXT
++#define FT800_CMD_BUTTON       CMD_BUTTON
++#define FT800_CMD_NUMBER       CMD_NUMBER
++#define FT800_CMD_SLIDER       CMD_SLIDER
++#define FT800_CMD_TOGGLE       CMD_TOGGLE
++#define FT800_CMD_CLOCK        CMD_CLOCK
++#define FT800_CMD_DIAL         CMD_DIAL
++#define FT800_CMD_KEYS         CMD_KEYS
++#define FT800_CMD_GRADCOLOR    CMD_GRADCOLOR
++#define FT800_CMD_GRADIENT     CMD_GRADIENT
++#define FT800_CMD_MEMWRITE     CMD_MEMWRITE
++#define FT800_CMD_MEMSET       CMD_MEMSET
++#define FT800_CMD_MEMCPY       CMD_MEMCPY
++#define FT800_CMD_INFLATE      CMD_INFLATE
++#define FT800_CMD_TRACK        CMD_TRACK
++#define FT800_CMD_LOGO         CMD_LOGO
++#define FT800_CMD_ROTATE       CMD_ROTATE
++#define FT800_CMD_SCALE        CMD_SCALE
++#define FT800_CMD_TRANSLATE    CMD_TRANSLATE
++#define FT800_CMD_SETFONT      CMD_SETFONT
++#define FT800_CMD_ROMFONT      CMD_ROMFONT
++#define FT800_CMD_SCROLLBAR    CMD_SCROLLBAR
++#define FT800_CMD_SPINNER      CMD_SPINNER
++#define FT800_CMD_STOP         CMD_STOP
++#define FT800_CMD_SKETCH       CMD_SKETCH
++#define FT800_CMD_SETSCRATCH   CMD_SETSCRATCH
++#define FT800_CMD_MEMCRC       CMD_MEMCRC
++#define FT800_CMD_REGREAD      CMD_REGREAD
++#define FT800_CMD_APPEND       CMD_APPEND
++#define FT800_CMD_BITMAP_HANDLE CMD_BITMAP_HANDLE
++#define FT800_CMD_BITMAP_LAYOUT CMD_BITMAP_LAYOUT
++#define FT800_CMD_BITMAP_SIZE   CMD_BITMAP_SIZE
++
++
++/* Host-commands (via ft800_host_cmd(), 3-byte SPI) */
++#define FT800_HOST_ACTIVE   0x00U   /* wake ↔ ACTIVE mode (dummy-read @0) */
++#define FT800_HOST_CLKEXT   0x44U   /* switch to external crystal */
++#define FT800_HOST_CLK48M   0x62U   /* switch PLL to 48 MHz */
++#define FT800_HOST_CORERST  0x68U   /* soft-reset core */
++
++
++struct ft800_dev {
++    struct spi_device *spi;
++    struct device *dev;
++    struct miscdevice misc;
++    struct regulator *vcc;
++    struct gpio_desc *gpiod_pdn;
++    struct gpio_desc *gpiod_int;
++    struct mutex lock;
++    bool is_open;
++    u16 touch_x, touch_y;
++    u8 touch_tag;
++    u32 reg_dlswap;
++    u16 write_index;
++    struct completion cmd_complete;
++    struct work_struct irq_work;
++    u32 dl_offset;
++};
++
++#endif /* _FT800_H_ */
++
+diff --git a/drivers/ft800-driver/ft800_uapi.h b/drivers/ft800-driver/ft800_uapi.h
+new file mode 100644
+index 000000000000..5a0cd268f47b
+--- /dev/null
++++ b/drivers/ft800-driver/ft800_uapi.h
+@@ -0,0 +1,149 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++#ifndef _UAPI_LINUX_FT800_H
++#define _UAPI_LINUX_FT800_H
++
++/* -------------------------------------------------------------------- */
++/*  Public types                                                        */
++/* -------------------------------------------------------------------- */
++#ifdef __KERNEL__
++# include <linux/types.h>
++# include <linux/ioctl.h>
++#else
++# include <stdint.h>
++# include <sys/ioctl.h>
++typedef uint8_t   __u8;
++typedef uint16_t  __u16;
++typedef uint32_t  __u32;
++typedef uint64_t  __u64;
++typedef  int16_t  __s16;
++typedef __u16     __le16;
++#endif
++
++#ifndef __packed                     /* keep user-space self-contained */
++# define __packed __attribute__((packed))
++#endif
++
++/* -------------------------------------------------------------------- */
++/*  Shared constants                                                    */
++/* -------------------------------------------------------------------- */
++#define FT800_MAX_CMD_TEXT_LEN   63U      /* text[] = 64 incl. NUL */
++
++/* -------------------------------------------------------------------- */
++/*  UAPI structures – must precede the _IO* macros that use sizeof()    */
++/* -------------------------------------------------------------------- */
++
++/* Touch sample returned by FT800_IOCTL_GET_TOUCH */
++struct ft800_touch {
++	__le16 x;
++	__le16 y;
++	__u8   tag;
++	__u8   pad;
++} __packed;
++
++/* Generic “co-processor command” slot */
++struct ft800_cmd {
++    __u32 cmd;
++    __u16 x, y;
++    __u16 w, h;
++    __u8  font;
++    __u8  options;
++    __u16 val;
++    __u16 range;
++    __u32 arg;
++    __u32 arg2;
++    __u32 count;
++    __u32 color0;
++    __u32 color1;
++    char  text[FT800_MAX_CMD_TEXT_LEN + 1];
++} __packed;
++
++struct ft800_cmd_array {
++    __u32 count;
++    struct ft800_cmd cmd[];  // must follow full struct definition
++} __packed;
++
++/* Keyboard definition struct */
++struct ft800_cmd_keys {
++	__u32 cmd;             /* encoded opcode or CMD_* token            */
++	__u16 x, y;
++	__u16 w, h;
++	__u8  font;
++	__u8  options;
++	const char *text;  // N key labels (one char each)
++       };
++
++/* Bulk command-list (userspace → RAM_CMD) */
++struct ft800_uapi_cmdlist {
++	__u32 addr;        /* must equal FT800_RAM_CMD                    */
++	__u32 len;         /* bytes (multiple of 4)                       */
++	__u32 user_ptr;    /* userspace pointer to contiguous __u32[]     */
++} __packed;
++
++/* Push a pre-mmapped staging buffer to RAM_DL or RAM_G */
++struct ft800_uapi_mmap_push {
++	__u32 addr;        /* FT800_RAM_DL or FT800_RAM_G                 */
++	__u32 len;         /* ≤ size of staging buffer                    */
++} __packed;
++
++/* Soft-reset & optional clear-to-colour */
++struct ft800_uapi_reset {
++	__u8 clear_display; /* 1 = clear before releasing PD_N            */
++	__u8 r, g, b;       /* clear colour                               */
++} __packed;
++
++/* Arbitrary memory I/O helper */
++struct ft800_mem_op {
++	__u32 addr;
++	__u32 len;                    /* driver clamps to sizeof(data)    */
++	__u8  data[4096];
++} __packed;
++
++/* Lightweight status snapshot */
++struct ft800_status {
++	__le16 cmd_read;   /* REG_CMD_READ                                */
++	__le16 cmd_write;  /* REG_CMD_WRITE                               */
++	__u8   id;         /* REG_ID                                      */
++	__u8   pad;
++} __packed;
++
++/* 0x0A ── **NEW**: feed an array of `struct ft800_cmd` descriptors.
++ * `user_ptr` points to the first element, `count` is the number
++ * of descriptors.  The kernel turns them into the byte-stream
++ * with ft800_cmd_enqueue()/ft800_serialize_cmds().
++ */
++struct ft800_uapi_exec_cmds {
++        __u32 user_ptr;   /* (uintptr_t) pointer to first descriptor */
++        __u32 count;      /* number of descriptors                   */
++} __packed;
++
++/* -------------------------------------------------------------------- */
++/*  ioctl interface – must come *after* struct definitions              */
++/* -------------------------------------------------------------------- */
++#define FT800_IOCTL_BASE   'F'
++
++#define FT800_IOCTL_GET_TOUCH    _IOR (FT800_IOCTL_BASE, 0x01, struct ft800_touch)
++#define FT800_IOCTL_SUBMIT_CMDS  _IOW (FT800_IOCTL_BASE, 0x02, struct ft800_uapi_exec_cmds)
++#define FT800_IOCTL_WRITE_CMDS   _IOW (FT800_IOCTL_BASE, 0x03, struct ft800_cmd_array)
++#define FT800_IOCTL_RESET        _IOW (FT800_IOCTL_BASE, 0x04, struct ft800_uapi_reset)
++#define FT800_IOCTL_MEMWRITE     _IOW (FT800_IOCTL_BASE, 0x06, struct ft800_mem_op)
++#define FT800_IOCTL_MEMREAD      _IOWR(FT800_IOCTL_BASE, 0x07, struct ft800_mem_op)
++#define FT800_IOCTL_GET_STATUS   _IOR (FT800_IOCTL_BASE, 0x08, struct ft800_status)
++#define FT800_IOCTL_CLEAR_DL     _IO  (FT800_IOCTL_BASE, 0x09)
++
++
++/* --------------------------------------------------------------------
++ *  Fine-grained register access helpers
++ * ------------------------------------------------------------------*/
++struct ft800_uapi_rw8  { __u32 addr; __u8  value; };
++struct ft800_uapi_rw16 { __u32 addr; __u16 value; };
++
++/* Keep ioctl numbers contiguous, avoid gaps for future proofing */
++#define FT800_IOCTL_WR8    _IOW (FT800_IOCTL_BASE, 0x0B, struct ft800_uapi_rw8)
++#define FT800_IOCTL_RD8    _IOWR(FT800_IOCTL_BASE, 0x0C, struct ft800_uapi_rw8)
++#define FT800_IOCTL_WR16   _IOW (FT800_IOCTL_BASE, 0x0D, struct ft800_uapi_rw16)
++#define FT800_IOCTL_RD16   _IOWR(FT800_IOCTL_BASE, 0x0E, struct ft800_uapi_rw16)
++
++
++
++#endif /* _UAPI_LINUX_FT800_H */
++
+--
+2.43.0
+

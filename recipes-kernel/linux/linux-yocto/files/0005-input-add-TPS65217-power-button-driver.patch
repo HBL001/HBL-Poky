@@ -1,0 +1,189 @@
+Upstream-Status: Inappropriate [embedded specific]
+From 0179be30b1476fe3ca2d74309f108cc90b877645 Mon Sep 17 00:00:00 2001
+From: Richard Day <richard_day@highlandbiosciences.com>
+Date: Sun, 1 Mar 2026 00:03:46 +0000
+Subject: [PATCH 5/6] input: add TPS65217 power button driver
+
+---
+ drivers/input/keyboard/Kconfig              |   6 +
+ drivers/input/keyboard/Makefile             |   1 +
+ drivers/input/keyboard/tps65217-pwrbutton.c | 138 ++++++++++++++++++++
+ 3 files changed, 145 insertions(+)
+ create mode 100644 drivers/input/keyboard/tps65217-pwrbutton.c
+
+diff --git a/drivers/input/keyboard/Kconfig b/drivers/input/keyboard/Kconfig
+index 1d0c5f4c0f99..6ae2112ca7dd 100644
+--- a/drivers/input/keyboard/Kconfig
++++ b/drivers/input/keyboard/Kconfig
+@@ -13,6 +13,12 @@ menuconfig INPUT_KEYBOARD
+
+ if INPUT_KEYBOARD
+
++config KEYBOARD_TPS65217
++	tristate "TI TPS65217 Power button"
++	depends on MFD_TPS65217
++	help
++	  Say Y here if you want support for the TPS65217 PMIC power button.
++
+ config KEYBOARD_ADC
+ 	tristate "ADC Ladder Buttons"
+ 	depends on IIO
+diff --git a/drivers/input/keyboard/Makefile b/drivers/input/keyboard/Makefile
+index aecef00c5d09..79171124de00 100644
+--- a/drivers/input/keyboard/Makefile
++++ b/drivers/input/keyboard/Makefile
+@@ -5,6 +5,7 @@
+
+ # Each configuration option enables a list of files.
+
++obj-$(CONFIG_KEYBOARD_TPS65217) 	+= tps65217-pwrbutton.o
+ obj-$(CONFIG_KEYBOARD_ADC)		+= adc-keys.o
+ obj-$(CONFIG_KEYBOARD_ADP5520)		+= adp5520-keys.o
+ obj-$(CONFIG_KEYBOARD_ADP5588)		+= adp5588-keys.o
+diff --git a/drivers/input/keyboard/tps65217-pwrbutton.c b/drivers/input/keyboard/tps65217-pwrbutton.c
+new file mode 100644
+index 000000000000..6cce4c68e873
+--- /dev/null
++++ b/drivers/input/keyboard/tps65217-pwrbutton.c
+@@ -0,0 +1,138 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/**
++ * @file    tps65217-pwrbutton.c
++ * @brief   TPS65217 Power Button Input Driver Lite
++ *
++ * This driver registers a Linux input device for the power button
++ * on the TI TPS65217 PMIC. It handles interrupts triggered on
++ * power button events and reports KEY_POWER events through the input subsystem.
++ *
++ * Compatible with the "tps65217-pwrbutton" MFD subdevice.
++ */
++
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/input.h>
++#include <linux/interrupt.h>
++#include <linux/slab.h>
++#include <linux/mfd/tps65217.h>
++
++/**
++ * @struct tps65217_pwrbutton
++ * @brief  Internal driver structure for power button handling.
++ */
++struct tps65217_pwrbutton {
++	struct input_dev *input;  /**< Input device for power button */
++	int irq;                  /**< IRQ line number */
++};
++
++/**
++ * @brief Interrupt handler for the TPS65217 power button
++ *
++ * Reports a KEY_POWER press and release to the input subsystem.
++ *
++ * @param irq      IRQ number (unused)
++ * @param dev_id   Pointer to tps65217_pwrbutton
++ * @return IRQ_HANDLED
++ */
++static irqreturn_t tps65217_pwrbutton_irq(int irq, void *dev_id)
++{
++	struct tps65217_pwrbutton *pwr = dev_id;
++
++	if ((pwr == NULL) || (pwr->input == NULL))
++		return IRQ_NONE;
++
++	input_report_key(pwr->input, KEY_POWER, 1);
++	input_sync(pwr->input);
++
++	input_report_key(pwr->input, KEY_POWER, 0);
++	input_sync(pwr->input);
++
++	return IRQ_HANDLED;
++}
++
++/**
++ * @brief Probe function for the TPS65217 power button driver
++ *
++ * Allocates and registers the input device, and requests the IRQ.
++ *
++ * @param pdev Platform device pointer
++ * @return 0 on success, negative error code on failure
++ */
++static int tps65217_pwrbutton_probe(struct platform_device *pdev)
++{
++	struct tps65217_pwrbutton *pwr;
++	struct input_dev *input;
++	int irq;
++	int error;
++
++	irq = platform_get_irq(pdev, 0);
++	if (irq < 0)
++		return irq;
++
++	pwr = devm_kzalloc(&pdev->dev, sizeof(*pwr), GFP_KERNEL);
++	if (pwr == NULL)
++		return -ENOMEM;
++
++	input = devm_input_allocate_device(&pdev->dev);
++	if (input == NULL)
++		return -ENOMEM;
++
++	pwr->input = input;
++	pwr->irq = irq;
++
++	input->name = "tps65217_pwrbutton";
++	input->phys = "tps65217/input0";
++	input->id.bustype = BUS_HOST;
++	input->dev.parent = &pdev->dev;
++
++	input_set_capability(input, EV_KEY, KEY_POWER);
++
++	error = devm_request_threaded_irq(&pdev->dev, irq,
++			NULL, tps65217_pwrbutton_irq,
++			IRQF_ONESHOT, "tps65217-pwrbutton", pwr);
++	if (error != 0) {
++		dev_err(&pdev->dev, "Unable to request IRQ %d: %d\n", irq, error);
++		return error;
++	}
++
++	error = input_register_device(input);
++	if (error != 0) {
++		dev_err(&pdev->dev, "Unable to register input device: %d\n", error);
++		return error;
++	}
++
++	platform_set_drvdata(pdev, pwr);
++	return 0;
++}
++
++/**
++ * @brief Remove function for the TPS65217 power button driver
++ *
++ * @param pdev Platform device pointer
++ * @return 0 (always succeeds)
++ */
++static int tps65217_pwrbutton_remove(struct platform_device *pdev)
++{
++	struct tps65217_pwrbutton *pwr = platform_get_drvdata(pdev);
++
++	if (pwr != NULL)
++		pwr->input = NULL;
++
++	return 0;
++}
++
++static struct platform_driver tps65217_pwrbutton_driver = {
++	.probe  = tps65217_pwrbutton_probe,
++	.remove = tps65217_pwrbutton_remove,
++	.driver = {
++		.name = "tps65217-pwrbutton",
++	},
++};
++
++module_platform_driver(tps65217_pwrbutton_driver);
++
++MODULE_AUTHOR("TI / Highland Biosciences Ltd");
++MODULE_DESCRIPTION("TPS65217 Power Button Driver lite");
++MODULE_LICENSE("GPL");
++
+--
+2.43.0
+
